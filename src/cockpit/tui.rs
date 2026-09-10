@@ -223,62 +223,375 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(9), Constraint::Min(3)])
         .split(cols[1]);
-    let (detail_text, tail_text) = match &app.detail {
-        Some(d) => {
-            let i = &d.info;
-            let head = format!(
-                "{} ({}) parent={} model={}\nstate={:?} outcome={}\nbudget: turn {}/{} (min {}) tokens {}/{} elapsed≈{}s (min {}s) refused {}\nverify: {}  pending msgs: {}\nnote: {}\ntask: {}",
-                i.name,
-                i.id,
-                i.parent.as_ref().map_or("-".into(), ToString::to_string),
-                i.model,
-                i.state,
-                i.outcome.as_ref().map_or("-".into(), ToString::to_string),
-                i.counters.turns,
-                i.budget.max_turns,
-                i.budget.min_turns,
-                i.counters.tokens,
-                i.budget.max_tokens,
-                i.counters.elapsed_before,
-                i.budget.min_seconds,
-                i.counters.done_refused,
-                i.last_verify_ok.map_or_else(|| String::from("never"), |ok| String::from(if ok { "OK" } else { "FAILED" })),
-                d.pending_messages,
-                i.last_note.as_deref().unwrap_or("-"),
-                d.task.lines().next().unwrap_or(""),
-            );
-            let tail = d
-                .tail
-                .iter()
-                .map(render_event)
-                .collect::<Vec<_>>()
-                .join("\n");
-            (head, tail)
-        }
-        None => ("no session selected".into(), String::new()),
+    let (detail, tail) = match &app.detail {
+        Some(d) => (detail_lines(d), d.tail.iter().map(event_line).collect()),
+        None => (
+            vec![Line::from(Span::styled(
+                "no session selected",
+                Style::default().fg(Color::DarkGray),
+            ))],
+            Vec::new(),
+        ),
     };
+    // Fixed-height header: truncate each line so none of them wraps out of view.
+    let inner = right[0].width.saturating_sub(2);
+    let detail: Vec<Line> = detail
+        .into_iter()
+        .map(|l| truncate_line(l, inner))
+        .collect();
     f.render_widget(
-        Paragraph::new(detail_text)
-            .wrap(Wrap { trim: false })
-            .block(Block::default().borders(Borders::ALL).title(" detail ")),
+        Paragraph::new(detail).block(Block::default().borders(Borders::ALL).title(" detail ")),
         right[0],
     );
-    let lines = tail_text.lines().count() as u16;
-    let h = right[1].height.saturating_sub(2);
-    let scroll = lines.saturating_sub(h);
+    // Keep only the last events that fit once wrapped, so the newest is always the
+    // last visible row. Counting logical lines here would undercount: one event can
+    // wrap over several rows, which is what used to push the newest ones out of view.
+    let tail = fit_tail(
+        tail,
+        right[1].width.saturating_sub(2),
+        right[1].height.saturating_sub(2),
+    );
     f.render_widget(
-        Paragraph::new(tail_text)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0))
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" trajectory tail "),
-            ),
+        Paragraph::new(tail).wrap(Wrap { trim: false }).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" trajectory tail "),
+        ),
         right[1],
     );
 }
 
+/// Rows a line occupies once wrapped into `width` columns.
+fn wrapped_rows(width_chars: usize, width: u16) -> u16 {
+    let w = usize::from(width.max(1));
+    u16::try_from(width_chars.max(1).div_ceil(w)).unwrap_or(u16::MAX)
+}
+
+fn line_chars(l: &Line<'_>) -> usize {
+    l.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+/// Cut a line to `width` columns, span by span, so a fixed-height pane cannot wrap.
+fn truncate_line(l: Line<'static>, width: u16) -> Line<'static> {
+    let max = usize::from(width);
+    let mut used = 0usize;
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(l.spans.len());
+    for span in l.spans {
+        let n = span.content.chars().count();
+        if used + n <= max {
+            used += n;
+            out.push(span);
+        } else {
+            let room = max.saturating_sub(used);
+            if room > 1 {
+                let cut: String = span.content.chars().take(room - 1).collect();
+                out.push(Span::styled(format!("{cut}…"), span.style));
+            }
+            break;
+        }
+    }
+    Line::from(out)
+}
+
+/// Keep the last lines that fit in `height` rows once wrapped into `width` columns.
+fn fit_tail(lines: Vec<Line<'static>>, width: u16, height: u16) -> Vec<Line<'static>> {
+    let mut used = 0u16;
+    let mut kept: Vec<Line<'static>> = Vec::new();
+    for l in lines.into_iter().rev() {
+        let rows = wrapped_rows(line_chars(&l), width);
+        if used.saturating_add(rows) > height && !kept.is_empty() {
+            break;
+        }
+        used = used.saturating_add(rows);
+        kept.push(l);
+        if used >= height {
+            break;
+        }
+    }
+    kept.reverse();
+    kept
+}
+
+const SINGLE_QUOTE: char = '\'';
+
+const KEYWORDS: &[&str] = &[
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+];
+
+/// The namespaces the runtime installs, highlighted so the eye finds them first.
+const BINDINGS: &[&str] = &[
+    "fs", "sh", "mem", "skill", "subagent", "prompt", "agent", "llm", "model", "compact", "verify",
+    "note", "done", "print",
+];
+
+/// A deliberately small Lua tokenizer: comments, strings, numbers, keywords and the
+/// runtime bindings. Enough to read a one-line snippet, not a full grammar.
+fn lua_spans(code: &str) -> Vec<Span<'static>> {
+    let kw = Style::default().fg(Color::Magenta);
+    let string = Style::default().fg(Color::Green);
+    let number = Style::default().fg(Color::Yellow);
+    let comment = Style::default().fg(Color::DarkGray);
+    let binding = Style::default().fg(Color::Cyan);
+    let plain = Style::default().fg(Color::Gray);
+
+    let mut out: Vec<Span<'static>> = Vec::new();
+    let chars: Vec<char> = code.chars().collect();
+    let mut i = 0usize;
+    let push = |out: &mut Vec<Span<'static>>, text: String, style: Style| {
+        if !text.is_empty() {
+            out.push(Span::styled(text, style));
+        }
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        if c == '-' && chars.get(i + 1) == Some(&'-') {
+            push(&mut out, chars[i..].iter().collect(), comment);
+            break;
+        }
+        if c == '"' || c == SINGLE_QUOTE {
+            let quote = c;
+            let start = i;
+            i += 1;
+            while i < chars.len() {
+                if chars[i] == '\\' {
+                    i += 2;
+                    continue;
+                }
+                if chars[i] == quote {
+                    i += 1;
+                    break;
+                }
+                i += 1;
+            }
+            push(
+                &mut out,
+                chars[start..i.min(chars.len())].iter().collect(),
+                string,
+            );
+            continue;
+        }
+        if c.is_ascii_digit() {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '.') {
+                i += 1;
+            }
+            push(&mut out, chars[start..i].iter().collect(), number);
+            continue;
+        }
+        if c.is_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            let word: String = chars[start..i].iter().collect();
+            let style = if KEYWORDS.contains(&word.as_str()) {
+                kw
+            } else if BINDINGS.contains(&word.as_str()) {
+                binding
+            } else {
+                plain
+            };
+            push(&mut out, word, style);
+            continue;
+        }
+        let start = i;
+        while i < chars.len()
+            && !chars[i].is_alphanumeric()
+            && chars[i] != '_'
+            && chars[i] != '"'
+            && chars[i] != '\''
+            && !(chars[i] == '-' && chars.get(i + 1) == Some(&'-'))
+        {
+            i += 1;
+        }
+        push(&mut out, chars[start..i].iter().collect(), plain);
+    }
+    out
+}
+
+fn one_line(s: &str, n: usize) -> String {
+    let flat = s.replace('\n', " ⏎ ");
+    let mut out: String = flat.chars().take(n).collect();
+    if flat.chars().count() > n {
+        out.push('…');
+    }
+    out
+}
+
+/// The header of the detail pane, one styled line per row.
+fn detail_lines(d: &SessionDetail) -> Vec<Line<'static>> {
+    let i = &d.info;
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::Gray);
+    let field = |k: &str, v: String| -> Line<'static> {
+        Line::from(vec![
+            Span::styled(format!("{k}: "), dim),
+            Span::styled(v, val),
+        ])
+    };
+    let verify = match i.last_verify_ok {
+        None => Span::styled("never", dim),
+        Some(true) => Span::styled("OK", Style::default().fg(Color::Green)),
+        Some(false) => Span::styled("FAILED", Style::default().fg(Color::Red)),
+    };
+    vec![
+        Line::from(vec![
+            Span::styled(
+                i.name.clone(),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!(" {} ", i.id), dim),
+            Span::styled(
+                format!("{:?}", i.state).to_lowercase(),
+                state_style(i.state),
+            ),
+            Span::styled(
+                i.outcome
+                    .as_ref()
+                    .map_or(String::new(), |o| format!("  [{o}]")),
+                dim,
+            ),
+        ]),
+        field(
+            "parent",
+            i.parent.as_ref().map_or("-".into(), ToString::to_string),
+        ),
+        field("model", i.model.to_string()),
+        Line::from(vec![
+            Span::styled("budget: ", dim),
+            Span::styled(
+                format!("turn {}/{}", i.counters.turns, i.budget.max_turns),
+                val,
+            ),
+            Span::styled(format!(" (min {})", i.budget.min_turns), dim),
+            Span::styled(format!("  tokens {}", i.counters.tokens), val),
+            Span::styled(format!("/{}", i.budget.max_tokens), dim),
+            Span::styled(format!("  refused {}", i.counters.done_refused), val),
+        ]),
+        Line::from(vec![
+            Span::styled("verify: ", dim),
+            verify,
+            Span::styled("  pending msgs: ", dim),
+            Span::styled(d.pending_messages.to_string(), val),
+        ]),
+        field("note", i.last_note.clone().unwrap_or_else(|| "-".into())),
+        field("task", one_line(d.task.lines().next().unwrap_or(""), 200)),
+    ]
+}
+
+/// One trajectory event as a styled line: a coloured kind, then its payload, with the
+/// Lua of an `exec` lightly highlighted.
+fn event_line(e: &Value) -> Line<'static> {
+    let kind = e["kind"].as_str().unwrap_or("?");
+    let turn = e["turn"].as_u64().unwrap_or(0);
+    let dim = Style::default().fg(Color::DarkGray);
+    let val = Style::default().fg(Color::Gray);
+    let mut spans = vec![Span::styled(format!("t{turn} "), dim)];
+    let label = |s: &str, c: Color| Span::styled(format!("{s} "), Style::default().fg(c));
+    match kind {
+        "exec" => {
+            spans.push(label("exec", Color::Cyan));
+            spans.extend(lua_spans(&one_line(e["code"].as_str().unwrap_or(""), 120)));
+            spans.push(Span::styled(" → ", dim));
+            let err = e["error"].as_str().unwrap_or("");
+            if err.is_empty() {
+                spans.push(Span::styled(
+                    one_line(e["output"].as_str().unwrap_or(""), 120),
+                    val,
+                ));
+            } else {
+                spans.push(Span::styled(
+                    one_line(err, 120),
+                    Style::default().fg(Color::Red),
+                ));
+            }
+        }
+        "assistant" => {
+            spans.push(label("assistant", Color::Blue));
+            spans.push(Span::styled(
+                format!("{} tok", e["usage"]["output_tokens"].as_u64().unwrap_or(0)),
+                dim,
+            ));
+        }
+        "note" => {
+            spans.push(label("note", Color::Yellow));
+            spans.push(Span::styled(
+                one_line(e["text"].as_str().unwrap_or(""), 200),
+                Style::default().fg(Color::Yellow),
+            ));
+        }
+        "message" => {
+            spans.push(label("message", Color::Magenta));
+            spans.push(Span::styled(
+                format!("from {} ", e["from"].as_str().unwrap_or("?")),
+                dim,
+            ));
+            spans.push(Span::styled(
+                one_line(e["body"].as_str().unwrap_or(""), 160),
+                val,
+            ));
+        }
+        "verify" => {
+            let ok = e["ok"].as_bool().unwrap_or(false);
+            spans.push(label("verify", if ok { Color::Green } else { Color::Red }));
+            spans.push(Span::styled(
+                format!(
+                    "{} in {}s",
+                    if ok { "OK" } else { "FAILED" },
+                    e["seconds"].as_u64().unwrap_or(0)
+                ),
+                val,
+            ));
+        }
+        "done_refused" => {
+            spans.push(label("done refused", Color::Red));
+            spans.push(Span::styled(
+                one_line(e["reason"].as_str().unwrap_or(""), 160),
+                val,
+            ));
+        }
+        "compact" => {
+            spans.push(label("compact", Color::Blue));
+            spans.push(Span::styled(
+                format!("{} → {} turns", e["turns_before"], e["turns_after"]),
+                dim,
+            ));
+        }
+        "model_switch" => {
+            spans.push(label("model", Color::Cyan));
+            spans.push(Span::styled(format!("{} → {}", e["from"], e["to"]), val));
+        }
+        "llm_error" => {
+            spans.push(label("llm error", Color::Red));
+            spans.push(Span::styled(
+                one_line(e["error"].as_str().unwrap_or(""), 160),
+                val,
+            ));
+        }
+        "finish" => {
+            let outcome = e["outcome"]["kind"].as_str().unwrap_or("");
+            let c = if outcome == "done" {
+                Color::Green
+            } else {
+                Color::Red
+            };
+            spans.push(Span::styled(
+                "finish ",
+                Style::default().fg(c).add_modifier(Modifier::BOLD),
+            ));
+            spans.push(Span::styled(one_line(&e["outcome"].to_string(), 160), val));
+        }
+        other => {
+            spans.push(label(other, Color::DarkGray));
+        }
+    }
+    Line::from(spans)
+}
+
+#[allow(dead_code)] // kept for `longe tail`, which prints plain text
 fn render_event(e: &Value) -> String {
     let kind = e["kind"].as_str().unwrap_or("?");
     let turn = e["turn"].as_u64().unwrap_or(0);
@@ -484,5 +797,122 @@ async fn event_loop(
             app.refresh().await;
             last_refresh = std::time::Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn plain(l: &Line<'_>) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn wrapped_rows_counts_visual_lines() {
+        assert_eq!(wrapped_rows(0, 10), 1, "an empty line still occupies a row");
+        assert_eq!(wrapped_rows(10, 10), 1);
+        assert_eq!(wrapped_rows(11, 10), 2);
+        assert_eq!(wrapped_rows(30, 10), 3);
+        assert_eq!(
+            wrapped_rows(5, 0),
+            5,
+            "a zero width must not divide by zero"
+        );
+    }
+
+    #[test]
+    fn fit_tail_keeps_the_newest_and_never_exceeds_the_pane() {
+        // Each line is 20 chars wide, so it wraps over 2 rows in a 10-wide pane.
+        let lines: Vec<Line> = (0..10).map(|i| Line::from(format!("{i:0>20}"))).collect();
+        let kept = fit_tail(lines, 10, 6);
+        let rows: u16 = kept.iter().map(|l| wrapped_rows(line_chars(l), 10)).sum();
+        assert!(rows <= 6, "{rows} rows must fit in 6");
+        assert_eq!(kept.len(), 3);
+        assert!(
+            plain(kept.last().unwrap()).ends_with('9'),
+            "the newest event must remain the last visible row"
+        );
+    }
+
+    #[test]
+    fn fit_tail_keeps_one_line_even_when_it_cannot_fit() {
+        let long = Line::from("x".repeat(500));
+        let kept = fit_tail(vec![long], 10, 3);
+        assert_eq!(kept.len(), 1, "never render an empty pane");
+    }
+
+    #[test]
+    fn truncate_line_cuts_at_the_pane_width() {
+        let l = Line::from(vec![Span::raw("abcde"), Span::raw("fghij")]);
+        assert_eq!(plain(&truncate_line(l.clone(), 20)), "abcdefghij");
+        let cut = truncate_line(l, 7);
+        assert_eq!(plain(&cut).chars().count(), 7);
+        assert!(plain(&cut).ends_with('…'));
+    }
+
+    #[test]
+    fn lua_highlighting_classifies_the_pieces() {
+        let spans = lua_spans("local x = fs.read('a.txt') -- note");
+        let styled: Vec<(String, Option<Color>)> = spans
+            .iter()
+            .map(|s| (s.content.to_string(), s.style.fg))
+            .collect();
+        let find = |t: &str| styled.iter().find(|(c, _)| c == t).map(|(_, f)| *f);
+        assert_eq!(find("local"), Some(Some(Color::Magenta)), "keyword");
+        assert_eq!(find("fs"), Some(Some(Color::Cyan)), "runtime binding");
+        assert_eq!(find("'a.txt'"), Some(Some(Color::Green)), "string");
+        assert_eq!(find("-- note"), Some(Some(Color::DarkGray)), "comment");
+        assert_eq!(find("x"), Some(Some(Color::Gray)), "identifier");
+        // Reassembling the spans must reproduce the input exactly.
+        let round: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(round, "local x = fs.read('a.txt') -- note");
+    }
+
+    #[test]
+    fn lua_highlighting_survives_odd_input() {
+        for code in [
+            "",
+            "'unterminated",
+            "-- only a comment",
+            "x = \"a\\\"b\"",
+            "1.5e3 + 0x1f",
+        ] {
+            let round: String = lua_spans(code).iter().map(|s| s.content.as_ref()).collect();
+            assert_eq!(round, code, "tokenizer must be lossless for {code:?}");
+        }
+    }
+
+    #[test]
+    fn event_lines_are_single_line_and_labelled() {
+        let exec = event_line(&json!({
+            "kind": "exec", "turn": 3,
+            "code": "fs.write('a',\n'b')", "output": "true"
+        }));
+        let text = plain(&exec);
+        assert!(text.starts_with("t3 exec "), "{text}");
+        assert!(text.contains(" ⏎ "), "newlines are flattened: {text}");
+        assert!(!text.contains('\n'), "an event must stay one logical line");
+
+        let failed = event_line(&json!({"kind": "verify", "turn": 1, "ok": false, "seconds": 4}));
+        assert!(plain(&failed).contains("FAILED"));
+        assert_eq!(failed.spans[1].style.fg, Some(Color::Red));
+
+        let ok = event_line(&json!({"kind": "verify", "turn": 1, "ok": true, "seconds": 4}));
+        assert_eq!(ok.spans[1].style.fg, Some(Color::Green));
+
+        let err = event_line(&json!({
+            "kind": "exec", "turn": 2, "code": "x", "output": "", "error": "boom"
+        }));
+        assert!(plain(&err).contains("boom"));
+    }
+
+    #[test]
+    fn long_event_payloads_are_bounded() {
+        let e = event_line(&json!({
+            "kind": "note", "turn": 1, "text": "z".repeat(5000)
+        }));
+        assert!(line_chars(&e) < 300, "a single event cannot flood the pane");
     }
 }

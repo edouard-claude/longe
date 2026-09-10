@@ -269,6 +269,11 @@ its trajectory below, and a box to message any session, running or asleep.
 ↑↓ select  i message  p pause  r resume  k kill  o offload  R reflect  d diffs  q quit
 ```
 
+Each event is one line, coloured by kind, with the Lua of an `exec` lightly
+highlighted: keywords, strings, numbers, comments and the runtime bindings. The tail
+keeps exactly the events that fit once wrapped, so the newest one is always the last
+visible row.
+
 `d` switches to the pending `reflect/` branches: the list on the left, the git diff on
 the right, `a` to accept, `x` to reject. Everything refreshes over the socket, so the
 cockpit can run on another machine through tailscale.
