@@ -1,0 +1,5 @@
+[{"name":"Ana","age":34,"city":"Lyon","tags":["dev","go"],"score":8.5},
+ {"name":"Bob","age":27,"city":"Paris","tags":["ops"],"score":6},
+ {"name":"Chloé","age":41,"city":"Lyon","tags":["dev","rust","lead"],"score":9.25},
+ {"name":"Dan","age":19,"city":"Nice","tags":[],"score":null},
+ {"name":"Eve","age":34,"city":"Paris","tags":["qa","dev"],"score":7}]

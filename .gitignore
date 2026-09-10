@@ -1,0 +1,15 @@
+/target
+/runs/
+*.sock
+.env
+.claude/
+
+# Generated eval sets: reproducible from gen-evals.sh and bench/gen-evals2.sh
+# against the real jq, so the cases themselves are not versioned.
+/store/evals/cases/
+/store/evals2/cases/
+
+# Live session state
+/store/sessions/
+/store/trajectories/
+/store/*.log

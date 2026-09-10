@@ -1,0 +1,8 @@
+too-many-arguments-threshold = 7
+cognitive-complexity-threshold = 30
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+disallowed-types = [
+  { path = "std::sync::Mutex", reason = "prefer parking_lot::Mutex, or an owning task with a channel" },
+]

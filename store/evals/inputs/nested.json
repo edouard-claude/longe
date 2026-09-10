@@ -1,0 +1,3 @@
+{"id":42,"meta":{"created":"2026-09-09","owner":{"name":"root","uid":0},"flags":[true,false,null]},
+ "items":[{"sku":"a1","qty":3,"price":2.5},{"sku":"b2","qty":0,"price":10},{"sku":"c3","qty":7,"price":0.99}],
+ "empty":{},"list":[],"text":"hello, world","n":-3.75}
