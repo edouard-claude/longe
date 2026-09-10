@@ -319,13 +319,13 @@ async fn done_is_refused_before_budget_and_while_verify_fails() {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn sub_agent_spawn_send_recv_report_and_wake() {
-    let mut w = world(|_| {}).await;
+    let w = world(|_| {}).await;
     w.script(
         "root",
         &[
             &lua("child = agent.spawn('worker', 'do a small job', {workspace = '.'}); agent.send(child, 'ping'); agent.send(agent.id(), 'note to self'); print(#agent.recv())"),
-            &lua("done('root idle, waiting for the report')"),
-            &lua("print(#agent.list()); done('got the report')"),
+            &lua("print(#agent.list()); done('root idle, waiting for the report')"),
+            &lua("done('ack')"),
         ],
     );
     w.script(
@@ -336,56 +336,48 @@ async fn sub_agent_spawn_send_recv_report_and_wake() {
         ],
     );
     let root = w.spawn("root", "delegate").await;
-    // Wait until root reaches its final "got the report" done. Extra events and their
-    // ordering under load are ignored; this is not count-sensitive.
-    let mut root_finishes = 0;
-    loop {
-        let ev = tokio::time::timeout(Duration::from_secs(30), w.finished.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        if ev.id == root {
-            root_finishes += 1;
-            if matches!(&ev.outcome, Outcome::Done { summary } if summary == "got the report") {
-                break;
+
+    // Poll observable state instead of finish events: whether the worker's report
+    // reaches root during root's own turn or wakes it afterwards is a genuine race,
+    // so nothing here may depend on the order or the count of events.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let (report, worker) = loop {
+        let sessions = w.tree.list().await.unwrap();
+        let worker = sessions.iter().find(|s| s.name == "worker");
+        let report = w
+            .events(&root)
+            .into_iter()
+            .find(|e| e["kind"] == "message" && e["from"] == "worker");
+        match (worker, report) {
+            (Some(wk), Some(r)) if wk.state != SessionState::Running => break (r, wk.clone()),
+            _ => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "worker never finished and reported to its parent"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
             }
         }
-    }
-    assert!(
-        root_finishes >= 2,
-        "root finishes, is woken by the report, and finishes again"
-    );
+    };
+
+    assert_eq!(worker.parent.as_ref(), Some(&root));
+    assert_eq!(worker.last_note.as_deref(), Some("half"));
+    assert!(report["body"].as_str().unwrap().contains("worker finished"));
+
     let outs = w.exec_outputs(&root);
     assert_eq!(
         outs[0], "1",
-        "self-sent message must be readable through agent.recv()"
+        "the self-sent message must be readable through agent.recv()"
     );
+    assert_eq!(outs[1], "2", "agent.list() sees both sessions");
+
+    // `print` uses tostring: a delivered ping renders as "1\tping", an inbox still
+    // empty as "0\tnil" (the ping is then read on a later turn). Both are legitimate.
+    let wouts = w.exec_outputs(&worker.id);
     assert!(
-        outs.iter().any(|o| o == "2"),
-        "agent.list() sees both sessions: {outs:?}"
+        wouts[0] == "1\tping" || wouts[0] == "0\tnil",
+        "unexpected first worker output: {wouts:?}"
     );
-    let ev = w.events(&root);
-    let report = ev
-        .iter()
-        .find(|e| e["kind"] == "message" && e["from"] == "worker")
-        .expect("report from worker");
-    assert!(report["body"].as_str().unwrap().contains("worker finished"));
-    let worker_id = w
-        .tree
-        .list()
-        .await
-        .unwrap()
-        .into_iter()
-        .find(|s| s.name == "worker")
-        .unwrap();
-    assert_eq!(worker_id.parent.as_ref(), Some(&root));
-    assert_eq!(worker_id.last_note.as_deref(), Some("half"));
-    let wouts = w.exec_outputs(&worker_id.id);
-    assert!(
-        wouts[0].starts_with("1\t\"ping\"") || wouts[0].starts_with("0"),
-        "{wouts:?}"
-    );
-    assert_eq!(w.state(&root).await, SessionState::Idle);
 }
 
 #[tokio::test(flavor = "multi_thread")]

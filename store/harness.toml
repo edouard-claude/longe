@@ -1,0 +1,49 @@
+# Longe harness configuration. Edit freely; reflection may also edit it.
+
+[model]
+provider = "ollama"
+name = "qwen3-vl:8b"
+temperature = 0.2
+context_window = 32768
+max_output_tokens = 8192
+
+[providers.ollama]
+kind = "ollama"
+base_url = "http://127.0.0.1:11434"
+# Add `think = false` only for models that support it; qwen3-vl fails on it.
+
+[providers.deepseek]
+kind = "openai"
+base_url = "https://api.deepseek.com/v1"
+api_key_env = "DEEPSEEK_API_KEY"
+
+[providers.openrouter]
+kind = "openai"
+base_url = "https://openrouter.ai/api/v1"
+api_key_env = "OPENROUTER_API_KEY"
+
+[providers.anthropic]
+kind = "anthropic"
+base_url = "https://api.anthropic.com"
+api_key_env = "ANTHROPIC_API_KEY"
+
+[budget]
+min_seconds = 1800
+min_turns = 20
+max_turns = 400
+max_tokens = 4000000
+
+[verify]
+command = "cargo test && cargo clippy -- -D warnings"
+
+[sandbox]
+mode = "workspace-write"
+network = false
+timeout_seconds = 300
+
+[reflect]
+enabled = true
+
+[compact]
+threshold = 0.7
+keep_last = 5

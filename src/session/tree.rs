@@ -446,14 +446,27 @@ impl Tree {
                 }
             }
         }
-        let slot = match outcome {
-            Outcome::Paused | Outcome::Killed => Slot::Paused { session },
-            _ => Slot::Idle {
+        let parked_idle = !matches!(outcome, Outcome::Paused | Outcome::Killed);
+        let slot = if parked_idle {
+            Slot::Idle {
                 session,
                 since: Instant::now(),
-            },
+            }
+        } else {
+            Slot::Paused { session }
         };
         self.slots.insert(id.clone(), slot);
+        // A message can land while a session is still running and finish before it
+        // drains its inbox: `send` only queues for a running session, because a
+        // running session drains on its own next turn. If that turn never comes, the
+        // message would sit unread forever, so wake the session now. Paused and
+        // killed sessions stay put; they are woken by an explicit resume.
+        if parked_idle && self.bus.pending(&id) > 0 {
+            tracing::debug!(session = %id, "finished with a pending message; waking");
+            if let Err(e) = self.wake(&id) {
+                tracing::warn!(session = %id, "cannot wake for pending message: {e}");
+            }
+        }
         if let Some(tx) = &self.finished {
             let _ = tx.send(FinishEvent { id, outcome }).await;
         }
