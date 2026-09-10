@@ -764,6 +764,11 @@ set -u
 BIN="${1:?path to rjq binary}"
 TIER="${2:-}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
+# `timeout` is GNU coreutils: present on Linux, often absent on macOS (where it is
+# `gtimeout` when coreutils is installed). Fall back to running without a timeout.
+if command -v timeout >/dev/null 2>&1; then TIMEOUT="timeout 5"
+elif command -v gtimeout >/dev/null 2>&1; then TIMEOUT="gtimeout 5"
+else TIMEOUT=""; fi
 total=0; pass=0; fails=()
 for d in "$DIR"/cases/*/; do
   t=$(cat "$d/tier")
@@ -772,7 +777,7 @@ for d in "$DIR"/cases/*/; do
   f=$(cat "$d/filter")
   want=$(cat "$d/expected")
   wexit=$(cat "$d/exit")
-  got=$(timeout 5 "$BIN" "$f" < "$d/input.json" 2>/dev/null)
+  got=$($TIMEOUT "$BIN" "$f" < "$d/input.json" 2>/dev/null)
   gexit=$?
   if [ "$gexit" -eq "$wexit" ] && { [ "$wexit" -ne 0 ] || [ "$got" == "$want" ]; }; then
     pass=$((pass+1))

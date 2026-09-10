@@ -361,7 +361,11 @@ in `git log`.
 
 The reference task is `rjq`, a `jq` clone in Rust. `gen-evals.sh` generates 693
 cases across six tiers with the real `jq` (self-check 693/693); `bench/gen-evals2.sh`
-generates 129 cases for the CLI-options follow-up task. `bench/ab.sh` runs protocol A
+generates 129 cases for the CLI-options follow-up task. The generated cases are not
+versioned: each run derives the expected outputs from whichever `jq` is installed, so
+the set is always self-consistent. A few expectations do depend on the `jq` version
+(`ltrimstr` on a non-string errors in 1.8 and does not in 1.7), which is exactly why
+the cases are regenerated rather than committed. `bench/ab.sh` runs protocol A
 (a plain JSON-tool loop, `longe baseline`) against protocol B (Longe, everything on)
 and a second B run, then prints green cases, tokens, turns, wall time, refused
 `done()` calls, sub-agents spawned and reflection diffs proposed and accepted.
