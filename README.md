@@ -1,7 +1,28 @@
-# Longe
+<h1 align="center">Longe</h1>
 
-**A self-improving harness for any LLM, in one Rust binary.**
-*The model is the engine; the runtime is the car.*
+<p align="center">
+  <b>A self-improving harness for any LLM, in one Rust binary.</b><br>
+  <i>The model is the engine; the runtime is the car.</i>
+</p>
+
+<p align="center">
+  <a href="https://github.com/edouard-claude/longe/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/edouard-claude/longe/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-blue.svg"></a>
+  <img alt="Rust 1.85+" src="https://img.shields.io/badge/rust-1.85%2B-orange?logo=rust&logoColor=white">
+  <img alt="unsafe: forbidden" src="https://img.shields.io/badge/unsafe-forbidden-success.svg">
+  <img alt="one binary" src="https://img.shields.io/badge/binaries-1-informational.svg">
+  <img alt="platforms" src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg">
+</p>
+
+<p align="center">
+  <a href="#the-thesis-we-build-on">Thesis</a> ·
+  <a href="#the-authors-and-what-we-took-from-each">Credits</a> ·
+  <a href="#what-longe-is">Architecture</a> ·
+  <a href="#quick-start">Quick start</a> ·
+  <a href="#the-lua-surface">Lua surface</a> ·
+  <a href="#sandbox">Sandbox</a> ·
+  <a href="#benchmark-prd-section-8">Benchmark</a>
+</p>
 
 A *longe* is the long rein used to let a horse run in a circle: it lets the animal
 go, and it sets the radius and the duration. Longe does the same for a language
@@ -218,6 +239,39 @@ Reattach with `longe tail <id>`. `longe ls`, `longe show <id>`, `longe send <id>
 The HTTP surface mirrors the socket on `127.0.0.1:7878` (`GET /sessions`,
 `GET /sessions/{id}`, `POST /sessions/{id}/message`, `GET /store/diffs`, ...) and is
 meant to be exposed through tailscale.
+
+## The cockpit
+
+`longe cockpit` opens a TUI over the daemon socket: the session tree on the left, the
+selected session's budget, last note and verifier state on the right, a live tail of
+its trajectory below, and a box to message any session, running or asleep.
+
+```text
+┌ sessions (3) ────────────────────┐┌ detail ──────────────────────────────────────┐
+│ 4a49e954 running root t12 41k    ││ root (4a49e954) parent=- model=openrouter/…  │
+│   c73551ed idle   parser t8 9k   ││ state=Running outcome=-                      │
+│     [done: parser ready]         ││ budget: turn 12/400 (min 20) tokens 41k/6M   │
+│   ffa656ff paused tester t3 2k   ││   elapsed≈610s (min 3600s) refused 1         │
+│                                  ││ verify: FAILED  pending msgs: 0              │
+│                                  ││ note: parser OK, evaluator next              │
+│                                  ││ task: Implement rjq, a jq clone in Rust…     │
+│                                  │└──────────────────────────────────────────────┘
+│                                  │┌ trajectory tail ─────────────────────────────┐
+│                                  ││ t10 exec: fs.write('src/parse.rs', … → ok    │
+│                                  ││ t11 verify ok=false (42s)                    │
+│                                  ││ t11 done refused: verifier failed… 612/693   │
+│                                  ││ t12 note: parser OK, evaluator next          │
+│                                  ││ t12 message from parser: report…             │
+└──────────────────────────────────┘└──────────────────────────────────────────────┘
+┌ message: press i to type ───────────────────────────────────────────────────────┐
+│                                                                                 │
+└─────────────────────────────────────────────────────────────────────────────────┘
+↑↓ select  i message  p pause  r resume  k kill  o offload  R reflect  d diffs  q quit
+```
+
+`d` switches to the pending `reflect/` branches: the list on the left, the git diff on
+the right, `a` to accept, `x` to reject. Everything refreshes over the socket, so the
+cockpit can run on another machine through tailscale.
 
 ## Configuration
 
