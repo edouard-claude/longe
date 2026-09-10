@@ -385,6 +385,45 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn returned_strings_are_escaped_for_reading_not_reloading() {
+        let f = fixture();
+        let run = |code: &str| tokio::task::block_in_place(|| f.repl.exec(code));
+        // A returned multi-line string must stay on one readable line, with no stray
+        // backslash: Lua's %q would emit a backslash before every real newline.
+        let r = run(r#"return "    }\n\n    fn parse(&mut self) {\n""#);
+        assert_eq!(r.output, r#""    }\n\n    fn parse(&mut self) {\n""#);
+        assert!(
+            !r.output.contains('\n'),
+            "the value must render on one line"
+        );
+        // Tabs, quotes, backslashes and other control bytes are escaped too.
+        let r = run(r#"return "a\tb\"c\\d\1e""#);
+        assert_eq!(r.output, r#""a\tb\"c\\d\001e""#);
+        // print() is unchanged: it uses tostring, so it keeps the raw text.
+        let r = run(r#"print("x\ny")"#);
+        assert_eq!(r.output, "x\ny");
+        // Strings nested in a table go through the same escaping.
+        let r = run(r#"return {k = "l1\nl2"}"#);
+        assert_eq!(r.output, r#"{k = "l1\nl2"}"#);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn state_serialization_still_round_trips_multiline_strings() {
+        let f = fixture();
+        tokio::task::block_in_place(|| {
+            f.repl.exec(r#"blob = "line1\nline2\ttab""#);
+        });
+        // The dump stays loadable Lua source, which is why it keeps %q.
+        let dump = f.repl.dump_state().unwrap();
+        let g = fixture();
+        g.repl.restore(&dump).unwrap();
+        let r = tokio::task::block_in_place(|| g.repl.exec("#blob"));
+        assert_eq!(r.output, "15", "the reloaded string must be byte identical");
+        let r = tokio::task::block_in_place(|| g.repl.exec(r#"blob:find("\n") ~= nil"#));
+        assert_eq!(r.output, "true", "the newline survived the round trip");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn cycles_do_not_break_dump() {
         let f = fixture();
         tokio::task::block_in_place(|| f.repl.exec("t = {}; t.self = t; t.v = 1"));

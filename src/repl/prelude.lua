@@ -12,12 +12,26 @@ local function sorted_keys(t)
   return ks
 end
 
+-- Quote a string for reading, not for reloading: string.format("%q") is meant to
+-- emit valid Lua source, so it writes a backslash followed by a real newline for
+-- every "\n". That is correct for __longe_dump, which is loaded back, and wrong
+-- here: it leaves a stray backslash on every line of the model's feedback. Escape
+-- the C way instead, so a multi-line value stays on one readable line.
+local function display_string(s)
+  local out = s:gsub('[\\"]', '\\%0')
+  out = out:gsub('\n', '\\n')
+  out = out:gsub('\r', '\\r')
+  out = out:gsub('\t', '\\t')
+  out = out:gsub('%c', function(c) return string.format('\\%03d', c:byte()) end)
+  return '"' .. out .. '"'
+end
+
 -- Human-readable rendering, depth and size limited.
 function __longe_fmt(v, depth, seen)
   depth = depth or 0
   seen = seen or {}
   local tv = type(v)
-  if tv == "string" then return string.format("%q", v) end
+  if tv == "string" then return display_string(v) end
   if tv ~= "table" then return tostring(v) end
   if seen[v] then return "<cycle>" end
   if depth >= 4 then return "{...}" end

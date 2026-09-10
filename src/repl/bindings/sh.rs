@@ -42,7 +42,9 @@ mod tests {
         let r = run(
             "local r = sh('echo hi; echo oops 1>&2; exit 2'); return r.stdout, r.stderr, r.code",
         );
-        assert_eq!(r.output, "\"hi\\\n\"\t\"oops\\\n\"\t2");
+        // Captured output renders on one line: "hi\n" rather than a backslash
+        // followed by a real newline, which is what %q used to produce.
+        assert_eq!(r.output, "\"hi\\n\"\t\"oops\\n\"\t2");
         let r = run("sh('pwd').stdout");
         let ws = std::fs::canonicalize(&f.workspace).unwrap();
         assert!(

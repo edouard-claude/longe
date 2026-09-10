@@ -572,17 +572,37 @@ fn event_line(e: &Value) -> Line<'static> {
             ));
         }
         "finish" => {
-            let outcome = e["outcome"]["kind"].as_str().unwrap_or("");
-            let c = if outcome == "done" {
+            let o = &e["outcome"];
+            let kind = o["kind"].as_str().unwrap_or("?");
+            let c = if kind == "done" {
                 Color::Green
             } else {
                 Color::Red
             };
             spans.push(Span::styled(
-                "finish ",
+                format!("finish {kind} "),
                 Style::default().fg(c).add_modifier(Modifier::BOLD),
             ));
-            spans.push(Span::styled(one_line(&e["outcome"].to_string(), 160), val));
+            // Show the one field that carries the reason, not the whole JSON object.
+            let detail = ["summary", "reason", "message"]
+                .iter()
+                .find_map(|k| o[*k].as_str())
+                .unwrap_or("");
+            spans.push(Span::styled(one_line(detail, 160), val));
+        }
+        "exhausted" => {
+            spans.push(label("exhausted", Color::Red));
+            spans.push(Span::styled(
+                e["reason"].as_str().unwrap_or("").to_string(),
+                val,
+            ));
+        }
+        "start" => {
+            spans.push(label("start", Color::Green));
+            spans.push(Span::styled(
+                one_line(e["task"].as_str().unwrap_or(""), 160),
+                val,
+            ));
         }
         other => {
             spans.push(label(other, Color::DarkGray));
