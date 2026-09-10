@@ -6,9 +6,20 @@ updates:
       interval: monthly
     open-pull-requests-limit: 5
     groups:
-      cargo:
+      # Patch and minor bumps are safe to batch and merge on a green CI.
+      # Major bumps are deliberately left as one PR each: they carry breaking
+      # API changes and deserve to be looked at on their own.
+      minor-and-patch:
         patterns: ["*"]
+        update-types: [minor, patch]
+    commit-message:
+      prefix: "deps"
   - package-ecosystem: github-actions
     directory: /
     schedule:
       interval: monthly
+    groups:
+      actions:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
