@@ -284,6 +284,27 @@ impl Default for CompactCfg {
     }
 }
 
+/// `[repl]`: the exec surface.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplCfg {
+    /// Bytes of exec output returned to the model (the head); the rest stays in `_last`.
+    #[serde(default = "default_max_output_bytes")]
+    pub max_output_bytes: usize,
+}
+
+fn default_max_output_bytes() -> usize {
+    8 * 1024
+}
+
+impl Default for ReplCfg {
+    fn default() -> Self {
+        Self {
+            max_output_bytes: default_max_output_bytes(),
+        }
+    }
+}
+
 /// `[daemon]`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -345,6 +366,8 @@ pub struct Harness {
     pub reflect: ReflectCfg,
     #[serde(default)]
     pub compact: CompactCfg,
+    #[serde(default)]
+    pub repl: ReplCfg,
     #[serde(default)]
     pub cron: Vec<CronJob>,
 }
@@ -472,6 +495,9 @@ mod tests {
         assert_eq!(h.sandbox.mode, SandboxMode::WorkspaceWrite);
         assert!(!h.sandbox.network);
         assert!((h.compact.threshold - 0.7).abs() < f32::EPSILON);
+        assert_eq!(h.repl.max_output_bytes, 8192);
+        let h = Harness::parse("[repl]\nmax_output_bytes = 16384\n").unwrap();
+        assert_eq!(h.repl.max_output_bytes, 16384);
     }
 
     #[test]

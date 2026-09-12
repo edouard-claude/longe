@@ -28,7 +28,21 @@ impl VerifyOutcome {
     }
 }
 
-/// Keep the last `max` bytes of a report, on a char boundary.
+/// The first `max` bytes of `s`, on a char boundary. For exec output: the model
+/// reads a file from its start, so the head is what it asked for.
+pub fn head_bytes(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut end = max;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
+/// Keep the last `max` bytes of a report, on a char boundary. For verifier
+/// reports: the failures are at the end.
 pub fn tail_bytes(s: &str, max: usize) -> String {
     if s.len() <= max {
         return s.to_string();
@@ -150,6 +164,17 @@ mod tests {
         let o = run(&cfg, &Unconfined, &p, Path::new("/x/store/evals")).unwrap();
         assert!(!o.ok);
         assert!(o.timed_out);
+    }
+
+    #[test]
+    fn head_keeps_first_bytes_on_char_boundaries() {
+        assert_eq!(head_bytes("abcdef", 3), "abc");
+        assert_eq!(head_bytes("abc", 10), "abc");
+        assert_eq!(head_bytes("", 0), "");
+        // `é` is two bytes: a cut inside it backs up to the boundary.
+        assert_eq!(head_bytes("ééé", 3), "é");
+        assert_eq!(head_bytes("ééé", 4), "éé");
+        assert_eq!(head_bytes("aé", 1), "a");
     }
 
     #[test]

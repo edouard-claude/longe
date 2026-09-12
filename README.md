@@ -204,7 +204,7 @@ The session loop, per turn:
 ```text
 drain bus → compile context (prompt.md + protocol + store index + lua state size
 + budget + last verify) → llm → parse
-  Exec(code) → lua.exec → feedback (8 KB, rest in _last) → apply effects
+  Exec(code) → lua.exec → feedback (head, `[repl] max_output_bytes`; rest in _last) → apply effects
   Done(s)    → budget.ok() && verify.ok() ? finish : refusal pushed back
   Text       → "reply with one lua block"
 context > 70 % of window → compact (task stays in the system prompt)
@@ -326,6 +326,7 @@ The model sees this reference in its system prompt:
 
 ```text
 fs.read(p) | fs.write(p, s) | fs.list(d) | fs.rm(p)           confined to the workspace
+fs.lines(p, from, to) -> numbered lines | fs.grep(text, p)    read by ranges, find sections
 sh(cmd, {timeout=s}) -> {stdout, stderr, code, timed_out}      sandboxed, store invisible
 mem.get/set/del/list/search   skill.get/set/del/list   subagent.get/set/del/list
 prompt.get() / prompt.set(s)                                   its own system prompt
@@ -336,7 +337,8 @@ model.switch(provider, name)                                   state is kept
 compact(hint) | verify() -> {ok, report} | note(s) | done(summary)
 ```
 
-Output over 8 KB is truncated and kept in `_last`. Globals persist; the serialized
+Output over `[repl] max_output_bytes` (8 KB by default, 16 KB from `longe init`) is cut
+after its head and kept whole in `_last`. Globals persist; the serialized
 size and the largest globals are shown to the model so it can garbage-collect its own
 state.
 

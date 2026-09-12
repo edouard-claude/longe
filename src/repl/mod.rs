@@ -20,9 +20,6 @@ use crate::verify::VerifyOutcome;
 
 const PRELUDE: &str = include_str!("prelude.lua");
 
-/// Bytes of exec output returned to the model; the rest stays in `_last`.
-pub const OUTPUT_LIMIT: usize = 8 * 1024;
-
 #[derive(Debug, thiserror::Error)]
 pub enum ReplError {
     #[error("lua: {0}")]
@@ -56,6 +53,8 @@ pub struct ReplCtx {
     pub model: Mutex<ModelRef>,
     pub temperature: f32,
     pub max_output_tokens: u32,
+    /// Bytes of exec output returned to the model (the head); the rest stays in `_last`.
+    pub max_output_bytes: usize,
     pub verify_cfg: VerifyCfg,
     pub evals_dir: PathBuf,
     pub rt: tokio::runtime::Handle,
@@ -75,7 +74,7 @@ impl std::fmt::Debug for ReplCtx {
 /// Result of one `exec`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecResult {
-    /// What goes back to the model (truncated).
+    /// What goes back to the model: the head of the output when truncated.
     pub output: String,
     pub full_len: usize,
     pub truncated: bool,
@@ -90,8 +89,9 @@ impl ExecResult {
         }
         if self.truncated {
             s.push_str(&format!(
-                "\n[output truncated: {} of {} bytes shown; full text in _last]",
-                OUTPUT_LIMIT, self.full_len
+                "\n[output truncated: first {} of {} bytes shown; full text in _last]",
+                self.output.len(),
+                self.full_len
             ));
         }
         if let Some(e) = &self.error {
@@ -126,9 +126,13 @@ impl Repl {
 
     /// Run a chunk. Expressions are evaluated and their values shown.
     pub fn exec(&self, code: &str) -> ExecResult {
-        if let Some(c) = self.lua.app_data_ref::<ReplCtx>() {
-            c.out.lock().clear();
-        }
+        let limit = match self.lua.app_data_ref::<ReplCtx>() {
+            Some(c) => {
+                c.out.lock().clear();
+                c.max_output_bytes
+            }
+            None => crate::config::ReplCfg::default().max_output_bytes,
+        };
         let expr = format!("return {code}");
         let chunk = match self.lua.load(&expr).set_name("=exec").into_function() {
             Ok(f) => Ok(f),
@@ -161,9 +165,10 @@ impl Repl {
         text.truncate(trimmed);
         let full_len = text.len();
         let _ = self.lua.globals().set("_last", text.as_str());
-        let truncated = full_len > OUTPUT_LIMIT;
+        let truncated = full_len > limit;
         let output = if truncated {
-            crate::verify::tail_bytes(&text, OUTPUT_LIMIT)
+            // The head, not the tail: a read starts at the top of the file.
+            crate::verify::head_bytes(&text, limit).to_string()
         } else {
             text
         };
@@ -300,6 +305,7 @@ pub(crate) mod testkit {
             model: Mutex::new(h.model.model_ref()),
             temperature: 0.0,
             max_output_tokens: 256,
+            max_output_bytes: h.repl.max_output_bytes,
             verify_cfg: VerifyCfg {
                 command: Some("test -f ok.txt".into()),
                 ..VerifyCfg::default()
@@ -316,7 +322,6 @@ pub(crate) mod testkit {
 #[cfg(test)]
 mod tests {
     use super::testkit::fixture;
-    use super::*;
 
     #[tokio::test(flavor = "multi_thread")]
     async fn expressions_and_prints_are_captured() {
@@ -350,12 +355,24 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn output_is_truncated_and_kept_in_last() {
         let f = fixture();
-        let r = tokio::task::block_in_place(|| f.repl.exec("print(string.rep('x', 20000))"));
+        let r = tokio::task::block_in_place(|| {
+            f.repl
+                .exec("print('HEAD' .. string.rep('x', 20000) .. 'TAIL')")
+        });
         assert!(r.truncated);
-        assert_eq!(r.full_len, 20000);
-        assert!(r.output.len() <= OUTPUT_LIMIT + 64);
-        let r = tokio::task::block_in_place(|| f.repl.exec("#_last"));
-        assert_eq!(r.output, "20000");
+        assert_eq!(r.full_len, 20008);
+        assert_eq!(r.output.len(), 8192, "exactly the configured head");
+        assert!(
+            r.output.starts_with("HEADxxxx"),
+            "the start is what is shown"
+        );
+        assert!(!r.output.contains("TAIL"));
+        assert!(r
+            .render()
+            .ends_with("[output truncated: first 8192 of 20008 bytes shown; full text in _last]"));
+        // `_last` is rewritten by every exec, so read both facts in one.
+        let r = tokio::task::block_in_place(|| f.repl.exec("return #_last, _last:sub(-4)"));
+        assert_eq!(r.output, "20008\t\"TAIL\"");
     }
 
     #[tokio::test(flavor = "multi_thread")]

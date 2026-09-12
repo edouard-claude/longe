@@ -57,6 +57,8 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
 
 /// The binding reference shown to the model.
 pub const REFERENCE: &str = r#"fs.read(path) -> string | fs.write(path, text) | fs.list(dir) -> {names} (dirs end with /) | fs.rm(path)   [paths relative to the workspace, confined to it]
+fs.lines(path, from, to) -> numbered lines `   12│text`, 1-based, inclusive, `to` defaults to from+199; ends with `[lines a-b of n]`   [read big files by ranges]
+fs.grep(text, path_or_dir) -> "path:line:text" lines, 200 max   [literal substring, not a regex; walks directories, skips hidden ones, target/ and node_modules/]
 sh(cmd, {timeout=seconds}) -> {stdout=, stderr=, code=, timed_out=}   [sandboxed shell in the workspace; the store is invisible; no network unless configured]
 mem.get(key) -> text|nil | mem.set(key, text) | mem.del(key) | mem.list() -> {{name=,head=,bytes=}} | mem.search(q) -> {{key=,snippet=}}
 skill.get(name) | skill.set(name, text) | skill.del(name) | skill.list()
@@ -67,4 +69,4 @@ agent.id() -> your own id | agent.send(id, text) | agent.recv() -> {{from=,from_
 llm.query(prompt, {model="provider/name", system=text}) -> text   [stateless call, no history]
 model.switch(provider, name)   [switch the model driving this session; state is kept]
 compact(hint) | verify() -> {ok=, report=} | note(text) | done(summary)
-_last holds the full output of the previous exec when it was truncated."#;
+_last holds the full output of the previous exec when it was truncated (the head was shown; `_last:sub(a, b)` reads the rest)."#;

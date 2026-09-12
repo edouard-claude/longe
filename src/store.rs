@@ -177,6 +177,11 @@ enabled = true
 [compact]
 threshold = 0.7
 keep_last = 5
+
+[repl]
+# Bytes of exec output shown to the model per turn (the head; the rest stays in
+# `_last`). Reading a spec in 8 KB slices costs a turn per slice: 16 KB halves that.
+max_output_bytes = 16384
 "#;
 
 const STORE_GITIGNORE: &str = "sessions/\ntrajectories/\nevals/cases/\n*.sock\n*.tmp-*\n";
@@ -591,6 +596,7 @@ mod tests {
         let (_d, s) = store();
         let h = s.harness().unwrap();
         assert_eq!(h.model.max_output_tokens, 16_384);
+        assert_eq!(h.repl.max_output_bytes, 16_384);
         let text = std::fs::read_to_string(s.harness_path()).unwrap();
         assert!(
             text.contains("Reasoning tokens count against this limit"),

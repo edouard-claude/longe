@@ -49,6 +49,93 @@ pub fn resolve(ws: &Path, p: &str) -> Result<PathBuf, String> {
     Ok(norm)
 }
 
+/// Lines shown by `fs.lines` when `to` is omitted.
+const LINES_SPAN: usize = 200;
+
+/// Matches shown by `fs.grep` before it stops.
+const GREP_MAX: usize = 200;
+
+/// Numbered lines `from..=to` (1-based) of `text`, then `[lines a-b of n]`.
+pub fn lines_view(text: &str, from: usize, to: Option<usize>) -> Result<String, String> {
+    if from == 0 {
+        return Err("lines are 1-based: from must be at least 1".into());
+    }
+    let lines: Vec<&str> = text.lines().collect();
+    let total = lines.len();
+    if from > total {
+        return Err(format!(
+            "from {from} is past the end: the file has {total} lines"
+        ));
+    }
+    let to = to
+        .unwrap_or_else(|| from.saturating_add(LINES_SPAN - 1))
+        .min(total);
+    if to < from {
+        return Err(format!("to {to} is before from {from}"));
+    }
+    let mut out = String::with_capacity((to - from + 1) * 64);
+    for (i, line) in lines[from - 1..to].iter().enumerate() {
+        out.push_str(&format!("{:>5}│{line}\n", from + i));
+    }
+    out.push_str(&format!("[lines {from}-{to} of {total}]"));
+    Ok(out)
+}
+
+/// Regular files under `p` (or `p` itself), skipping hidden entries, build
+/// directories and symlinks, so a link cannot lead outside the workspace.
+fn collect_files(p: &Path, out: &mut Vec<PathBuf>) {
+    if p.is_file() {
+        out.push(p.to_path_buf());
+        return;
+    }
+    let Ok(rd) = std::fs::read_dir(p) else {
+        return;
+    };
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') || name == "target" || name == "node_modules" {
+            continue;
+        }
+        if e.file_type().map_or(true, |t| t.is_symlink()) {
+            continue;
+        }
+        collect_files(&e.path(), out);
+    }
+}
+
+/// `path:line:text` for every line containing `pattern` (literal), at most
+/// `GREP_MAX` of them, files in path order. Non-UTF-8 files are skipped.
+pub fn grep(ws: &Path, root: &Path, pattern: &str) -> String {
+    let mut files = Vec::new();
+    collect_files(root, &mut files);
+    files.sort();
+    let mut out: Vec<String> = Vec::new();
+    'files: for f in &files {
+        let Ok(text) = std::fs::read_to_string(f) else {
+            continue;
+        };
+        let rel = f.strip_prefix(ws).unwrap_or(f).display();
+        for (i, line) in text.lines().enumerate() {
+            if !line.contains(pattern) {
+                continue;
+            }
+            if out.len() == GREP_MAX {
+                out.push(format!(
+                    "[{GREP_MAX}+ matches; narrow the pattern or the path]"
+                ));
+                break 'files;
+            }
+            out.push(format!("{rel}:{}:{line}", i + 1));
+        }
+    }
+    if out.is_empty() {
+        "(no match)".into()
+    } else {
+        out.join("\n")
+    }
+}
+
 pub fn install(lua: &Lua) -> mlua::Result<()> {
     let t = lua.create_table()?;
     t.set(
@@ -57,6 +144,33 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
             let c = ctx(lua)?;
             let path = resolve(&c.workspace, &p).map_err(rt_err)?;
             std::fs::read_to_string(&path).map_err(|e| rt_err(format!("{p}: {e}")))
+        })?,
+    )?;
+    t.set(
+        "lines",
+        lua.create_function(
+            |lua, (p, from, to): (String, Option<usize>, Option<usize>)| {
+                let c = ctx(lua)?;
+                let path = resolve(&c.workspace, &p).map_err(rt_err)?;
+                let text =
+                    std::fs::read_to_string(&path).map_err(|e| rt_err(format!("{p}: {e}")))?;
+                lines_view(&text, from.unwrap_or(1), to).map_err(|e| rt_err(format!("{p}: {e}")))
+            },
+        )?,
+    )?;
+    t.set(
+        "grep",
+        lua.create_function(|lua, (pattern, p): (String, Option<String>)| {
+            if pattern.is_empty() {
+                return Err(rt_err("fs.grep: empty pattern"));
+            }
+            let c = ctx(lua)?;
+            let p = p.unwrap_or_else(|| ".".into());
+            let path = resolve(&c.workspace, &p).map_err(rt_err)?;
+            if !path.exists() {
+                return Err(rt_err(format!("{p}: no such file or directory")));
+            }
+            Ok(grep(&c.workspace, &path, &pattern))
         })?,
     )?;
     t.set(
@@ -152,5 +266,66 @@ mod tests {
         assert_eq!(run("fs.rm('dir')").output, "false");
         assert!(run("fs.rm('.')").error.is_some());
         assert!(f.workspace.exists());
+    }
+
+    #[test]
+    fn lines_view_numbers_and_bounds() {
+        let text = (1..=668)
+            .map(|i| format!("line {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let v = lines_view(&text, 1, None).unwrap();
+        assert!(v.starts_with("    1│line 1\n    2│line 2\n"), "{v}");
+        assert!(v.ends_with("  200│line 200\n[lines 1-200 of 668]"), "{v}");
+        let v = lines_view(&text, 660, Some(9000)).unwrap();
+        assert!(v.ends_with("  668│line 668\n[lines 660-668 of 668]"), "{v}");
+        let v = lines_view(&text, 12, Some(12)).unwrap();
+        assert_eq!(v, "   12│line 12\n[lines 12-12 of 668]");
+        assert!(lines_view(&text, 0, None).unwrap_err().contains("1-based"));
+        assert!(lines_view(&text, 669, None)
+            .unwrap_err()
+            .contains("past the end"));
+        assert!(lines_view(&text, 10, Some(5))
+            .unwrap_err()
+            .contains("before from"));
+        assert!(
+            lines_view("", 1, None).is_err(),
+            "an empty file has no line 1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lines_and_grep_bindings() {
+        let f = fixture();
+        let run = |code: &str| tokio::task::block_in_place(|| f.repl.exec(code));
+        run("fs.write('src/a.rs', 'fn a() {}\\n// TODO one\\nfn b() {}\\n')");
+        run("fs.write('src/sub/b.rs', '// TODO two\\nfn c() {}\\n')");
+        run("fs.write('.hidden/c.rs', '// TODO hidden\\n')");
+        run("fs.write('target/d.rs', '// TODO built\\n')");
+        assert_eq!(
+            run("fs.lines('src/a.rs', 2, 3)").output,
+            "\"    2│// TODO one\\n    3│fn b() {}\\n[lines 2-3 of 3]\""
+        );
+        let r = run("fs.lines('src/a.rs', 0)");
+        assert!(r.error.as_deref().unwrap().contains("1-based"), "{r:?}");
+        let r = run("fs.lines('nope.rs')");
+        assert!(r.error.is_some());
+        // A directory walk: path order, hidden and build directories skipped.
+        assert_eq!(
+            run("fs.grep('TODO', 'src')").output,
+            "\"src/a.rs:2:// TODO one\\nsrc/sub/b.rs:1:// TODO two\""
+        );
+        assert_eq!(
+            run("fs.grep('TODO')").output,
+            "\"src/a.rs:2:// TODO one\\nsrc/sub/b.rs:1:// TODO two\""
+        );
+        // A single file, and a literal pattern (no regex).
+        assert_eq!(
+            run("fs.grep('fn c()', 'src/sub/b.rs')").output,
+            "\"src/sub/b.rs:2:fn c() {}\""
+        );
+        assert_eq!(run("fs.grep('fn .()', 'src')").output, "\"(no match)\"");
+        assert!(run("fs.grep('', 'src')").error.is_some());
+        assert!(run("fs.grep('x', '../store')").error.is_some());
     }
 }

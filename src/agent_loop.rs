@@ -41,18 +41,24 @@ impl std::fmt::Debug for LoopDeps {
     }
 }
 
-const PROTOCOL: &str = r#"## Runtime protocol (fixed)
-You drive a persistent Lua 5.4 REPL. Every turn, reply with exactly ONE fenced ```lua block; it is executed and its
-output (prints and returned values, max 8 KB) comes back as the next message. Prose outside the block is ignored.
-Your Lua globals persist across turns and across restarts. Define helpers once and reuse them; keep big data in
-variables instead of re-reading it. Output over 8 KB is truncated and kept in `_last`.
-Finish with `done("summary")` inside the block: it is accepted only after the minimum budget AND a passing
-`verify()`. If refused, keep improving: more tests, edge cases, refactors, notes for your future self.
-Messages from the human, your parent, your children or siblings are injected between turns; read them.
-Split parallelizable work across sub-agents with `agent.spawn`; they report back when done.
-
-## Bindings
-"#;
+/// The fixed part of the system prompt, with the numbers taken from `harness.toml`.
+fn protocol(h: &Harness) -> String {
+    let kb = h.repl.max_output_bytes.div_euclid(1024);
+    format!(
+        "## Runtime protocol (fixed)\n\
+You drive a persistent Lua 5.4 REPL. Every turn, reply with exactly ONE fenced ```lua block; it is executed and its\n\
+output (prints and returned values, max {kb} KB) comes back as the next message. Prose outside the block is ignored.\n\
+Your Lua globals persist across turns and across restarts. Define helpers once and reuse them; keep big data in\n\
+variables instead of re-reading it. Output over {kb} KB is cut after its head and kept whole in `_last`; read big\n\
+files by ranges with `fs.lines` and find sections with `fs.grep` instead of printing them whole.\n\
+Finish with `done(\"summary\")` inside the block: it is accepted only after the minimum budget AND a passing\n\
+`verify()`. If refused, keep improving: more tests, edge cases, refactors, notes for your future self.\n\
+Messages from the human, your parent, your children or siblings are injected between turns; read them.\n\
+Split parallelizable work across sub-agents with `agent.spawn`; they report back when done.\n\
+\n\
+## Bindings\n"
+    )
+}
 
 fn build_system(deps: &LoopDeps, session: &Session, budget: &Budget, repl: &Repl) -> String {
     let store = &deps.store;
@@ -61,7 +67,7 @@ fn build_system(deps: &LoopDeps, session: &Session, budget: &Budget, repl: &Repl
     let mut s = String::with_capacity(8 * 1024);
     s.push_str(prompt.trim());
     s.push_str("\n\n");
-    s.push_str(PROTOCOL);
+    s.push_str(&protocol(&deps.harness));
     s.push_str(REFERENCE);
     s.push_str("\n\n## Session\n");
     s.push_str(&format!(
@@ -158,6 +164,7 @@ fn make_repl(deps: &Arc<LoopDeps>, session: &Session) -> Result<Repl, String> {
         model: Mutex::new(session.meta.model.clone()),
         temperature: h.model.temperature,
         max_output_tokens: h.model.max_output_tokens,
+        max_output_bytes: h.repl.max_output_bytes,
         verify_cfg: h.verify.clone(),
         evals_dir: deps.store.evals_dir(),
         rt: tokio::runtime::Handle::current(),
