@@ -478,6 +478,9 @@ async fn run_inner(
 /// Ceiling of the one retry after a truncated reply.
 const TRUNCATED_RETRY_CAP: u32 = 65_536;
 
+/// Source writes since the last verifier run that earn a reminder in the feedback.
+const VERIFY_REMINDER_AFTER: u32 = 3;
+
 fn truncated_feedback(output_tokens: u64, reasoning_tokens: u64) -> String {
     format!(
         "Your reply was cut at {output_tokens} output tokens ({reasoning_tokens} of reasoning) and was NOT executed. \
@@ -548,6 +551,7 @@ async fn apply_effects(
         );
         session.meta.model = m;
     }
+    session.meta.source_writes_since_verify += effects.source_writes;
     if let Some(v) = effects.verify {
         log(
             store,
@@ -555,6 +559,15 @@ async fn apply_effects(
             json!({"kind": "verify", "ok": v.ok, "code": v.code, "seconds": v.seconds}),
         );
         session.meta.last_verify = Some(v);
+        session.meta.source_writes_since_verify = 0;
+    }
+    // The verifier is the model's only view of the evals; nag when it codes blind.
+    // No automatic run: a verifier can take half an hour.
+    let unverified = session.meta.source_writes_since_verify;
+    if unverified >= VERIFY_REMINDER_AFTER {
+        feedback.push_str(&format!(
+            "\n[{unverified} source files written since the last verify(): run it, its report lists the failing cases.]"
+        ));
     }
     if let Some(hint) = effects.compact {
         compact_now(session, deps, &hint).await;
@@ -594,6 +607,7 @@ async fn try_finish(
             let ok = v.ok;
             let text = v.summary();
             session.meta.last_verify = Some(v);
+            session.meta.source_writes_since_verify = 0;
             if ok {
                 Ok(summary)
             } else {

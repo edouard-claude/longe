@@ -53,6 +53,9 @@ pub struct SessionMeta {
     pub notes: VecDeque<Note>,
     #[serde(default)]
     pub last_verify: Option<VerifyOutcome>,
+    /// `fs.write` calls on source files since the last verifier run.
+    #[serde(default)]
+    pub source_writes_since_verify: u32,
     #[serde(default)]
     pub compactions: u32,
     #[serde(default)]
@@ -90,6 +93,7 @@ impl Session {
                 last_note: None,
                 notes: VecDeque::new(),
                 last_verify: None,
+                source_writes_since_verify: 0,
                 compactions: 0,
                 spawned: 0,
                 children: Vec::new(),

@@ -553,6 +553,58 @@ async fn truncated_replies_retry_once_then_feed_back_and_survive() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn three_unverified_source_writes_earn_a_verify_reminder() {
+    let mut w = world(|h| h.verify.command = Some("true".into())).await;
+    w.script(
+        "root",
+        &[
+            &lua("fs.write('src/a.rs', '1'); fs.write('README.md', 'x')"),
+            &lua("fs.write('lib/b.py', '2')"),
+            &lua("fs.write('src/c.rs', '3')"),
+            &lua("print('still unverified')"),
+            &lua("verify()"),
+            &lua("fs.write('src/d.rs', '4')"),
+            &lua("done('ok')"),
+        ],
+    );
+    let id = w.spawn("root", "write then verify").await;
+    assert!(matches!(w.wait_finish(&id).await, Outcome::Done { .. }));
+    let reqs = w.fake.requests.lock();
+    // The feedback of turn k is the last user message of request k+1.
+    let feedback = |k: usize| {
+        reqs[k + 1].2.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    const NAG: &str = "source files written since the last verify()";
+    assert!(!feedback(0).contains(NAG), "one write: {}", feedback(0));
+    assert!(!feedback(1).contains(NAG), "two writes: {}", feedback(1));
+    assert!(
+        feedback(2).contains(&format!(
+            "[3 {NAG}: run it, its report lists the failing cases.]"
+        )),
+        "{}",
+        feedback(2)
+    );
+    assert!(
+        feedback(3).contains(&format!("[3 {NAG}")),
+        "still nagging: {}",
+        feedback(3)
+    );
+    assert!(
+        !feedback(4).contains(NAG),
+        "verify() resets: {}",
+        feedback(4)
+    );
+    assert!(
+        !feedback(5).contains(NAG),
+        "one write since: {}",
+        feedback(5)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pause_resume_kill() {
     let mut w = world(|h| h.budget.max_turns = 1000).await;
     // Default script: infinite ticks.

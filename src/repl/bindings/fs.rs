@@ -136,6 +136,17 @@ pub fn grep(ws: &Path, root: &Path, pattern: &str) -> String {
     }
 }
 
+/// A path the verifier most likely covers: a source extension, or anything
+/// under `src/`. Counted so the loop can nag when writes pile up unverified.
+pub fn is_source_path(p: &str) -> bool {
+    let p = p.trim_start_matches("./");
+    let ext = Path::new(p)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("");
+    matches!(ext, "rs" | "py" | "go" | "ts" | "js") || p.starts_with("src/")
+}
+
 pub fn install(lua: &Lua) -> mlua::Result<()> {
     let t = lua.create_table()?;
     t.set(
@@ -182,6 +193,9 @@ pub fn install(lua: &Lua) -> mlua::Result<()> {
                 std::fs::create_dir_all(parent).map_err(|e| rt_err(format!("{p}: {e}")))?;
             }
             std::fs::write(&path, text).map_err(|e| rt_err(format!("{p}: {e}")))?;
+            if is_source_path(&p) {
+                c.effects.lock().source_writes += 1;
+            }
             Ok(true)
         })?,
     )?;
@@ -266,6 +280,32 @@ mod tests {
         assert_eq!(run("fs.rm('dir')").output, "false");
         assert!(run("fs.rm('.')").error.is_some());
         assert!(f.workspace.exists());
+        // Source writes are counted for the verify reminder; other files are not.
+        run("fs.write('src/m.rs', ''); fs.write('notes.md', '')");
+        assert_eq!(f.repl.take_effects().source_writes, 1);
+    }
+
+    #[test]
+    fn source_paths_are_recognised() {
+        for p in [
+            "src/a.rs",
+            "./src/x/y.txt",
+            "lib/b.py",
+            "cmd/main.go",
+            "web/app.ts",
+            "a.js",
+        ] {
+            assert!(is_source_path(p), "{p}");
+        }
+        for p in [
+            "README.md",
+            "Cargo.toml",
+            "docs/src/a.md",
+            "tests/data.json",
+            "srcs/a.c",
+        ] {
+            assert!(!is_source_path(p), "{p}");
+        }
     }
 
     #[test]

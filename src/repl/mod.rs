@@ -37,6 +37,8 @@ pub struct Effects {
     pub spawned: u32,
     pub sent: u32,
     pub llm_tokens: u64,
+    /// `fs.write` calls on source files (see `bindings::fs::is_source_path`).
+    pub source_writes: u32,
 }
 
 /// Everything the bindings need. Lives in Lua app data.
