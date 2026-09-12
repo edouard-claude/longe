@@ -1,6 +1,7 @@
 //! One session's persistent state: metadata, L1 history, and (lazily) its Lua VM.
 //! Everything is written under `sessions/<id>/` every turn.
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -20,6 +21,17 @@ pub struct Turn {
     pub ts: String,
 }
 
+/// One `note()` call, shown back to the model with the turn it was made on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Note {
+    pub turn: u32,
+    pub text: String,
+}
+
+/// Notes kept in the system prompt: the most recent ones, each cut short.
+pub const NOTES_KEPT: usize = 8;
+pub const NOTE_MAX_CHARS: usize = 500;
+
 /// `meta.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionMeta {
@@ -36,6 +48,9 @@ pub struct SessionMeta {
     pub outcome: Option<Outcome>,
     #[serde(default)]
     pub last_note: Option<String>,
+    /// The last `NOTES_KEPT` notes, oldest first.
+    #[serde(default)]
+    pub notes: VecDeque<Note>,
     #[serde(default)]
     pub last_verify: Option<VerifyOutcome>,
     #[serde(default)]
@@ -73,6 +88,7 @@ impl Session {
                 counters: BudgetCounters::default(),
                 outcome: None,
                 last_note: None,
+                notes: VecDeque::new(),
                 last_verify: None,
                 compactions: 0,
                 spawned: 0,
@@ -103,6 +119,18 @@ impl Session {
             content: content.into(),
             ts: now_rfc3339(),
         });
+    }
+
+    /// Record a `note()`: the cockpit keeps the last one whole, the model sees the
+    /// last `NOTES_KEPT`, each cut at `NOTE_MAX_CHARS`.
+    pub fn push_note(&mut self, text: String) {
+        let turn = self.meta.counters.turns;
+        let short: String = text.chars().take(NOTE_MAX_CHARS).collect();
+        self.meta.notes.push_back(Note { turn, text: short });
+        while self.meta.notes.len() > NOTES_KEPT {
+            self.meta.notes.pop_front();
+        }
+        self.meta.last_note = Some(text);
     }
 
     /// Persist meta, history and the Lua state.
@@ -238,18 +266,54 @@ mod tests {
         s.push_turn(Role::User, "task");
         s.push_turn(Role::Assistant, "```lua\nx=1\n```");
         s.meta.counters.turns = 3;
-        s.meta.last_note = Some("note".into());
+        s.push_note("note".into());
         s.save(&store).unwrap();
         let back = Session::load(&store, s.id()).unwrap();
         assert_eq!(back.history.len(), 2);
         assert_eq!(back.meta.counters.turns, 3);
         assert_eq!(back.meta.model, model);
         assert_eq!(back.meta.last_note.as_deref(), Some("note"));
+        assert_eq!(
+            back.meta.notes,
+            VecDeque::from(vec![Note {
+                turn: 3,
+                text: "note".into()
+            }])
+        );
         assert_eq!(Session::list_on_disk(&store), vec![s.id().clone()]);
         assert!(Session::saved_state(&store, s.id()).is_none());
         let info = back.info(SessionState::Idle);
         assert_eq!(info.name, "root");
         assert_eq!(info.state, SessionState::Idle);
+    }
+
+    #[test]
+    fn notes_keep_the_last_eight_and_cut_long_ones() {
+        let model = ModelRef {
+            provider: "p".into(),
+            name: "m".into(),
+        };
+        let mut s = Session::new(&spec(), model, BudgetCfg::default());
+        for i in 1..=10u32 {
+            s.meta.counters.turns = i;
+            s.push_note(format!("n{i}"));
+        }
+        let turns: Vec<u32> = s.meta.notes.iter().map(|n| n.turn).collect();
+        assert_eq!(turns, vec![3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(s.meta.last_note.as_deref(), Some("n10"));
+        let long = "é".repeat(NOTE_MAX_CHARS + 50);
+        s.push_note(long.clone());
+        let last = s.meta.notes.back().unwrap();
+        assert_eq!(last.text.chars().count(), NOTE_MAX_CHARS);
+        assert_eq!(s.meta.last_note.as_deref(), Some(long.as_str()));
+        // Old meta.json files have no `notes` key.
+        let meta: SessionMeta = serde_json::from_str(
+            &serde_json::to_string(&s.meta)
+                .unwrap()
+                .replace("\"notes\":", "\"_x\":"),
+        )
+        .unwrap();
+        assert!(meta.notes.is_empty());
     }
 
     #[test]

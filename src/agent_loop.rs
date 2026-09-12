@@ -9,6 +9,7 @@
 //!
 //! The module is `agent_loop` because `loop` is a keyword.
 
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -22,7 +23,7 @@ use crate::llm::{ChatMessage, ChatRequest, LlmError, LlmRegistry, Role};
 use crate::parse::{self, Action};
 use crate::repl::{bindings::REFERENCE, Effects, Repl, ReplCtx};
 use crate::sandbox::{Policy, Sandbox};
-use crate::session::state::Session;
+use crate::session::state::{Note, Session};
 use crate::session::{now_rfc3339, Ctl, Outcome, SessionInfo, SessionState, TreeHandle};
 use crate::store::Store;
 
@@ -54,10 +55,23 @@ files by ranges with `fs.lines` and find sections with `fs.grep` instead of prin
 Finish with `done(\"summary\")` inside the block: it is accepted only after the minimum budget AND a passing\n\
 `verify()`. If refused, keep improving: more tests, edge cases, refactors, notes for your future self.\n\
 Messages from the human, your parent, your children or siblings are injected between turns; read them.\n\
+Your notes are shown back to you in the `Your notes` section below; do not repeat a note that is already there.\n\
 Split parallelizable work across sub-agents with `agent.spawn`; they report back when done.\n\
 \n\
 ## Bindings\n"
     )
+}
+
+/// The `## Your notes` section of the system prompt, empty when there is none.
+fn notes_section(notes: &VecDeque<Note>) -> String {
+    if notes.is_empty() {
+        return String::new();
+    }
+    let mut s = String::from("\n## Your notes (oldest first)\n");
+    for n in notes {
+        s.push_str(&format!("- t{}: {}\n", n.turn, n.text.replace('\n', " ")));
+    }
+    s
 }
 
 fn build_system(deps: &LoopDeps, session: &Session, budget: &Budget, repl: &Repl) -> String {
@@ -123,6 +137,7 @@ fn build_system(deps: &LoopDeps, session: &Session, budget: &Budget, repl: &Repl
                 .join(", ")
         ));
     }
+    s.push_str(&notes_section(&session.meta.notes));
     s
 }
 
@@ -362,7 +377,12 @@ async fn run_inner(
 
         // 5. act
         let mut done_request: Option<String> = None;
-        match parse::parse(&resp.text) {
+        let parsed = parse::parse(&resp.text);
+        for tag in &parsed.leaked {
+            tracing::warn!(session = %session.meta.id, "model leaked a <{tag}> block; stripped");
+            log(&store, session, json!({"kind": "leaked_tag", "tag": tag}));
+        }
+        match parsed.action {
             Action::Exec(code) => {
                 let Some(repl) = session.repl.as_ref() else {
                     return Outcome::Error {
@@ -473,7 +493,7 @@ async fn apply_effects(
     let store = &deps.store;
     for n in effects.notes {
         log(store, session, json!({"kind": "note", "text": n}));
-        session.meta.last_note = Some(n);
+        session.push_note(n);
     }
     if effects.spawned > 0 {
         session.meta.spawned += effects.spawned;
@@ -579,5 +599,29 @@ async fn compact_now(session: &mut Session, deps: &Arc<LoopDeps>, hint: &str) {
                 json!({"kind": "compact_failed", "error": e.to_string()}),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn notes_section_lists_notes_oldest_first_on_one_line_each() {
+        assert_eq!(notes_section(&VecDeque::new()), "");
+        let notes = VecDeque::from(vec![
+            Note {
+                turn: 34,
+                text: "Plan: implement tier by tier".into(),
+            },
+            Note {
+                turn: 40,
+                text: "tier1: 1 crypto/xxtea\nthen aes".into(),
+            },
+        ]);
+        assert_eq!(
+            notes_section(&notes),
+            "\n## Your notes (oldest first)\n- t34: Plan: implement tier by tier\n- t40: tier1: 1 crypto/xxtea then aes\n"
+        );
     }
 }
