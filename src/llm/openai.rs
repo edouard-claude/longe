@@ -4,9 +4,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use super::provider::{
-    estimate_request, estimate_tokens, ChatRequest, ChatResponse, LlmError, Role, Usage,
-};
+use super::provider::{ChatRequest, ChatResponse, LlmError, Role, Usage};
 
 #[derive(Debug, Clone)]
 pub struct OpenAiClient {
@@ -77,6 +75,7 @@ impl OpenAiClient {
         }
         let mut stream = resp.bytes_stream().eventsource();
         let mut text = String::new();
+        let mut reasoning_chars = 0usize;
         let mut usage = Usage::default();
         let mut got_usage = false;
         let mut stop_reason = None;
@@ -98,6 +97,11 @@ impl OpenAiClient {
                 if let Some(t) = choice["delta"]["content"].as_str() {
                     text.push_str(t);
                 }
+                // DeepSeek and friends stream the chain of thought as
+                // `reasoning_content`; only its size matters here.
+                if let Some(t) = choice["delta"]["reasoning_content"].as_str() {
+                    reasoning_chars += t.chars().count();
+                }
                 if let Some(s) = choice["finish_reason"].as_str() {
                     stop_reason = Some(s.to_string());
                 }
@@ -110,22 +114,31 @@ impl OpenAiClient {
                 if let Some(n) = u["completion_tokens"].as_u64() {
                     usage.output_tokens = n;
                 }
+                if let Some(n) = u["completion_tokens_details"]["reasoning_tokens"].as_u64() {
+                    usage.reasoning_tokens = n;
+                }
             }
+        }
+        let usage_estimated = !got_usage;
+        if usage_estimated {
+            usage = Usage::estimated(req, &text);
+        }
+        if stop_reason.as_deref().is_some_and(LlmError::is_length_stop) {
+            return Err(LlmError::Truncated {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+            });
         }
         if text.is_empty() {
             return Err(LlmError::Empty);
-        }
-        if !got_usage {
-            usage = Usage {
-                input_tokens: estimate_request(req),
-                output_tokens: estimate_tokens(&text),
-            };
         }
         Ok(ChatResponse {
             text,
             usage,
             stop_reason,
-            usage_estimated: !got_usage,
+            usage_estimated,
+            reasoning_chars,
         })
     }
 }

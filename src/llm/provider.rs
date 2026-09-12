@@ -43,11 +43,24 @@ pub struct ChatRequest {
 pub struct Usage {
     pub input_tokens: u64,
     pub output_tokens: u64,
+    /// Reasoning tokens, when the provider reports them. They are part of
+    /// `output_tokens` and count against `max_tokens`.
+    #[serde(default)]
+    pub reasoning_tokens: u64,
 }
 
 impl Usage {
     pub fn total(self) -> u64 {
         self.input_tokens + self.output_tokens
+    }
+
+    /// Estimate when a provider sends no usage.
+    pub fn estimated(req: &ChatRequest, text: &str) -> Self {
+        Self {
+            input_tokens: estimate_request(req),
+            output_tokens: estimate_tokens(text),
+            reasoning_tokens: 0,
+        }
     }
 }
 
@@ -58,6 +71,8 @@ pub struct ChatResponse {
     pub stop_reason: Option<String>,
     /// True when the provider sent no usage and the numbers are estimates.
     pub usage_estimated: bool,
+    /// Characters of reasoning streamed before the answer (the text is not kept).
+    pub reasoning_chars: usize,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +89,14 @@ pub enum LlmError {
     UnknownProvider(String),
     #[error("empty response")]
     Empty,
+    /// The provider stopped at `max_tokens`. Replaying the same request is useless:
+    /// the caller must raise the limit or ask for a shorter answer.
+    #[error("response truncated at {output_tokens} output tokens ({reasoning_tokens} of reasoning): raise max_tokens or ask for less")]
+    Truncated {
+        input_tokens: u64,
+        output_tokens: u64,
+        reasoning_tokens: u64,
+    },
     #[error("retries exhausted after {attempts} attempts: {last}")]
     Exhausted { attempts: u32, last: Box<LlmError> },
 }
@@ -84,8 +107,16 @@ impl LlmError {
             Self::Http(e) => e.is_connect() || e.is_timeout() || e.is_request() || e.is_body(),
             Self::Status { status, .. } => *status == 429 || *status == 408 || *status >= 500,
             Self::Stream(_) | Self::Empty => true,
-            Self::MissingApiKey { .. } | Self::UnknownProvider(_) | Self::Exhausted { .. } => false,
+            Self::MissingApiKey { .. }
+            | Self::UnknownProvider(_)
+            | Self::Truncated { .. }
+            | Self::Exhausted { .. } => false,
         }
+    }
+
+    /// The stop reasons the three protocols use for "hit max_tokens".
+    pub fn is_length_stop(reason: &str) -> bool {
+        matches!(reason, "length" | "max_tokens")
     }
 }
 
@@ -136,5 +167,17 @@ mod tests {
             var: "K".into()
         }
         .is_retryable());
+        assert!(
+            !LlmError::Truncated {
+                input_tokens: 1,
+                output_tokens: 2,
+                reasoning_tokens: 1
+            }
+            .is_retryable(),
+            "replaying a truncated request verbatim cannot help"
+        );
+        assert!(LlmError::is_length_stop("length"));
+        assert!(LlmError::is_length_stop("max_tokens"));
+        assert!(!LlmError::is_length_stop("stop"));
     }
 }

@@ -4,9 +4,7 @@ use eventsource_stream::Eventsource;
 use futures_util::StreamExt;
 use serde_json::{json, Value};
 
-use super::provider::{
-    estimate_request, estimate_tokens, ChatRequest, ChatResponse, LlmError, Role, Usage,
-};
+use super::provider::{ChatRequest, ChatResponse, LlmError, Role, Usage};
 
 #[derive(Debug, Clone)]
 pub struct AnthropicClient {
@@ -120,20 +118,26 @@ impl AnthropicClient {
                 _ => {}
             }
         }
+        let usage_estimated = !got_usage;
+        if usage_estimated {
+            usage = Usage::estimated(req, &text);
+        }
+        if stop_reason.as_deref().is_some_and(LlmError::is_length_stop) {
+            return Err(LlmError::Truncated {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+            });
+        }
         if text.is_empty() {
             return Err(LlmError::Empty);
-        }
-        if !got_usage {
-            usage = Usage {
-                input_tokens: estimate_request(req),
-                output_tokens: estimate_tokens(&text),
-            };
         }
         Ok(ChatResponse {
             text,
             usage,
             stop_reason,
-            usage_estimated: !got_usage,
+            usage_estimated,
+            reasoning_chars: 0,
         })
     }
 }

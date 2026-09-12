@@ -50,6 +50,9 @@ impl std::fmt::Display for Exhausted {
 pub struct BudgetCounters {
     pub turns: u32,
     pub tokens: u64,
+    /// Share of `tokens` the provider reported as reasoning (informational).
+    #[serde(default)]
+    pub reasoning_tokens: u64,
     pub done_refused: u32,
     /// Seconds spent in earlier runs of this session (before a pause/offload).
     pub elapsed_before: u64,
@@ -105,15 +108,20 @@ impl Budget {
         self.counters.done_refused
     }
 
-    /// One LLM round trip happened.
     /// Tokens spent outside the main turn (llm.query leaves).
     pub fn tick_tokens(&mut self, tokens: u64) {
         self.counters.tokens = self.counters.tokens.saturating_add(tokens);
     }
 
+    /// One LLM round trip happened.
     pub fn tick(&mut self, tokens: u64) {
         self.counters.turns = self.counters.turns.saturating_add(1);
         self.counters.tokens = self.counters.tokens.saturating_add(tokens);
+    }
+
+    /// Reasoning share reported by the provider for the round trips already ticked.
+    pub fn tick_reasoning(&mut self, tokens: u64) {
+        self.counters.reasoning_tokens = self.counters.reasoning_tokens.saturating_add(tokens);
     }
 
     /// Is `done()` allowed now? A refusal is counted.

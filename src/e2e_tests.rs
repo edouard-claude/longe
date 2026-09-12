@@ -18,11 +18,14 @@ use crate::session::tree::{spawn_tree_with, FinishEvent};
 use crate::session::{Message, Outcome, SessionId, SessionState, SpawnSpec, TreeHandle};
 use crate::store::Store;
 
+/// One request seen by the fake server: (model, system, messages, max_tokens).
+type SeenRequest = (String, String, Vec<Value>, u64);
+
 #[derive(Default)]
 struct Fake {
     scripts: Mutex<HashMap<String, VecDeque<String>>>,
-    /// (model, system, messages) per request, in order.
-    requests: Mutex<Vec<(String, String, Vec<Value>)>>,
+    /// Every request, in order.
+    requests: Mutex<Vec<SeenRequest>>,
     prompt_tokens: Mutex<u64>,
 }
 
@@ -52,7 +55,10 @@ async fn handler(
         .filter(|m| m["role"] != "system")
         .cloned()
         .collect();
-    fake.requests.lock().push((model, system.clone(), history));
+    let max_tokens = body["max_tokens"].as_u64().unwrap_or(0);
+    fake.requests
+        .lock()
+        .push((model, system.clone(), history, max_tokens));
     let reply = if system.starts_with("You compress") {
         "## Progress\nSUMMARY OF OLDER TURNS\n## Next steps\ncontinue".to_string()
     } else if system.starts_with("You improve the harness") {
@@ -66,10 +72,20 @@ async fn handler(
             .unwrap_or_else(|| "```lua\nprint('tick')\n```".to_string())
     };
     let pt = *fake.prompt_tokens.lock();
-    let chunks = [
-        json!({"choices":[{"delta":{"content": reply},"finish_reason":"stop"}]}).to_string(),
-        json!({"choices":[],"usage":{"prompt_tokens": pt, "completion_tokens": 10}}).to_string(),
-    ];
+    // A scripted `@length` plays a reasoning model that spent the whole limit
+    // thinking: no content, a reasoning delta, `finish_reason: "length"`.
+    let chunks = if reply == "@length" {
+        [
+            json!({"choices":[{"delta":{"reasoning_content": "thinking..."},"finish_reason":"length"}]}).to_string(),
+            json!({"choices":[],"usage":{"prompt_tokens": pt, "completion_tokens": 8192, "completion_tokens_details": {"reasoning_tokens": 8000}}}).to_string(),
+        ]
+    } else {
+        [
+            json!({"choices":[{"delta":{"content": reply},"finish_reason":"stop"}]}).to_string(),
+            json!({"choices":[],"usage":{"prompt_tokens": pt, "completion_tokens": 10}})
+                .to_string(),
+        ]
+    };
     let mut sse = String::new();
     for c in chunks {
         sse.push_str(&format!("data: {c}\n\n"));
@@ -442,6 +458,54 @@ async fn compaction_keeps_the_task_and_recent_turns() {
     let session = crate::session::state::Session::load(&w.store, &id).unwrap();
     assert!(session.meta.compactions >= 2);
     assert!(session.history.len() <= 6);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn truncated_replies_retry_once_then_feed_back_and_survive() {
+    let mut w = world(|h| h.model.max_output_tokens = 1000).await;
+    w.script(
+        "root",
+        &[
+            "@length",
+            "@length",
+            &lua("print('after the cut')"),
+            &lua("done('survived')"),
+        ],
+    );
+    let id = w.spawn("root", "survive a truncated reply").await;
+    assert!(matches!(w.wait_finish(&id).await, Outcome::Done { .. }));
+    let ev = w.events(&id);
+    assert!(
+        !ev.iter().any(|e| e["kind"] == "llm_error"),
+        "a truncated reply is not an llm error: {ev:?}"
+    );
+    let truncated: Vec<&Value> = ev.iter().filter(|e| e["kind"] == "truncated").collect();
+    assert_eq!(truncated.len(), 2, "{ev:?}");
+    assert_eq!(
+        truncated[0]["retried_with"], 2000,
+        "one retry at twice the limit"
+    );
+    assert!(truncated[1]["retried_with"].is_null(), "no second retry");
+    assert_eq!(truncated[0]["reasoning_tokens"], 8000);
+    {
+        let reqs = w.fake.requests.lock();
+        let limits: Vec<u64> = reqs.iter().map(|r| r.3).collect();
+        assert_eq!(limits, vec![1000, 2000, 1000, 1000]);
+        // The turn after the second cut carries the feedback, and only then.
+        let third_user = reqs[2].2.last().unwrap()["content"].as_str().unwrap();
+        assert!(
+            third_user.contains("cut at 8192 output tokens (8000 of reasoning)"),
+            "{third_user}"
+        );
+        assert!(!reqs[1].2.last().unwrap()["content"]
+            .as_str()
+            .unwrap()
+            .contains("cut at"));
+    }
+    assert_eq!(w.exec_outputs(&id)[0], "after the cut");
+    let info = w.tree.get(id.clone(), 0).await.unwrap().unwrap().info;
+    assert_eq!(info.counters.reasoning_tokens, 16_000);
+    assert_eq!(info.counters.turns, 4, "each round trip is a turn");
 }
 
 #[tokio::test(flavor = "multi_thread")]

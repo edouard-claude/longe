@@ -127,6 +127,16 @@ impl App {
     }
 }
 
+/// `41k`, or `41k (+3k reasoning)` when the provider reports reasoning tokens.
+fn tokens_k(c: &crate::budget::BudgetCounters) -> String {
+    let k = c.tokens.div_euclid(1000);
+    if c.reasoning_tokens > 0 {
+        format!("{k}k (+{}k reasoning)", c.reasoning_tokens.div_euclid(1000))
+    } else {
+        format!("{k}k")
+    }
+}
+
 fn state_style(s: SessionState) -> Style {
     match s {
         SessionState::Running => Style::default().fg(Color::Green),
@@ -194,10 +204,10 @@ fn draw_sessions(f: &mut Frame, app: &App, area: Rect) {
                     state_style(s.state),
                 ),
                 Span::raw(format!(
-                    " {} t{} {}k{}",
+                    " {} t{} {}{}",
                     s.name,
                     s.counters.turns,
-                    s.counters.tokens.div_euclid(1000),
+                    tokens_k(&s.counters),
                     outcome
                 )),
             ]);
@@ -469,6 +479,14 @@ fn detail_lines(d: &SessionDetail) -> Vec<Line<'static>> {
             Span::styled(format!(" (min {})", i.budget.min_turns), dim),
             Span::styled(format!("  tokens {}", i.counters.tokens), val),
             Span::styled(format!("/{}", i.budget.max_tokens), dim),
+            Span::styled(
+                if i.counters.reasoning_tokens > 0 {
+                    format!(" (+{} reasoning)", i.counters.reasoning_tokens)
+                } else {
+                    String::new()
+                },
+                dim,
+            ),
             Span::styled(format!("  refused {}", i.counters.done_refused), val),
         ]),
         Line::from(vec![
@@ -511,8 +529,31 @@ fn event_line(e: &Value) -> Line<'static> {
         }
         "assistant" => {
             spans.push(label("assistant", Color::Blue));
+            let reasoning = e["usage"]["reasoning_tokens"].as_u64().unwrap_or(0);
             spans.push(Span::styled(
-                format!("{} tok", e["usage"]["output_tokens"].as_u64().unwrap_or(0)),
+                format!(
+                    "{} tok{}",
+                    e["usage"]["output_tokens"].as_u64().unwrap_or(0),
+                    if reasoning > 0 {
+                        format!(" (+{reasoning} reasoning)")
+                    } else {
+                        String::new()
+                    }
+                ),
+                dim,
+            ));
+        }
+        "truncated" => {
+            spans.push(label("truncated", Color::Red));
+            let retry = e["retried_with"]
+                .as_u64()
+                .map_or_else(|| "fed back".to_string(), |m| format!("retry at {m}"));
+            spans.push(Span::styled(
+                format!(
+                    "{} tok ({} reasoning), {retry}",
+                    e["output_tokens"].as_u64().unwrap_or(0),
+                    e["reasoning_tokens"].as_u64().unwrap_or(0)
+                ),
                 dim,
             ));
         }

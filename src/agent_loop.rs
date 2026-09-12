@@ -236,6 +236,8 @@ async fn run_inner(
         log(&store, session, json!({"kind": "resume"}));
     }
     let mut consecutive_errors = 0u32;
+    // Set after a truncated reply: the next request is the one retry at a higher limit.
+    let mut retry_max_tokens: Option<u32> = None;
     let window = f64::from(deps.harness.model.context_window);
     let threshold = f64::from(deps.harness.compact.threshold);
 
@@ -267,12 +269,13 @@ async fn run_inner(
             };
         };
         let system = build_system(deps, session, &budget, repl);
+        let max_tokens = retry_max_tokens.unwrap_or(deps.harness.model.max_output_tokens);
         let req = ChatRequest {
             model: session.meta.model.name.clone(),
             system,
             messages: compile_messages(session),
             temperature: deps.harness.model.temperature,
-            max_tokens: deps.harness.model.max_output_tokens,
+            max_tokens,
         };
         // 4. llm
         let resp = tokio::select! {
@@ -284,7 +287,44 @@ async fn run_inner(
         let resp = match resp {
             Ok(r) => {
                 consecutive_errors = 0;
+                retry_max_tokens = None;
                 r
+            }
+            Err(LlmError::Truncated {
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+            }) => {
+                // Paid for, but neither an error nor a usable reply: the block is
+                // probably incomplete, so it is never executed. Retry once with a higher
+                // limit, then tell the model to write less per turn.
+                budget.tick(input_tokens + output_tokens);
+                budget.tick_reasoning(reasoning_tokens);
+                let retry = match retry_max_tokens {
+                    None => Some(max_tokens.saturating_mul(2).min(TRUNCATED_RETRY_CAP)),
+                    Some(_) => None,
+                };
+                tracing::warn!(
+                    session = %session.meta.id,
+                    output_tokens, reasoning_tokens, ?retry,
+                    "reply truncated at max_tokens={max_tokens}"
+                );
+                log(
+                    &store,
+                    session,
+                    json!({"kind": "truncated", "output_tokens": output_tokens, "reasoning_tokens": reasoning_tokens, "max_tokens": max_tokens, "retried_with": retry}),
+                );
+                retry_max_tokens = retry;
+                if retry.is_none() {
+                    session.push_turn(
+                        Role::User,
+                        truncated_feedback(output_tokens, reasoning_tokens),
+                    );
+                }
+                if let Some(outcome) = persist_and_check(session, &store, &budget, info_tx) {
+                    return outcome;
+                }
+                continue;
             }
             Err(e) => {
                 consecutive_errors += 1;
@@ -304,12 +344,13 @@ async fn run_inner(
             }
         };
         budget.tick(resp.usage.total());
+        budget.tick_reasoning(resp.usage.reasoning_tokens);
         session.meta.counters = budget.freeze();
         session.push_turn(Role::Assistant, resp.text.clone());
         log(
             &store,
             session,
-            json!({"kind": "assistant", "text": resp.text, "usage": resp.usage, "estimated": resp.usage_estimated, "stop": resp.stop_reason}),
+            json!({"kind": "assistant", "text": resp.text, "usage": resp.usage, "estimated": resp.usage_estimated, "stop": resp.stop_reason, "reasoning_chars": resp.reasoning_chars}),
         );
 
         // 5. act
@@ -368,23 +409,42 @@ async fn run_inner(
             compact_now(session, deps, "").await;
         }
 
-        // 8. persist + publish
-        session.meta.counters = budget.freeze();
-        if let Err(e) = session.save(&store) {
-            tracing::error!(session = %session.meta.id, "save failed: {e}");
-        }
-        let _ = info_tx.send(session.info(SessionState::Running));
-
-        // 9. exhausted?
-        if let Some(reason) = budget.exhausted() {
-            log(
-                &store,
-                session,
-                json!({"kind": "exhausted", "reason": reason}),
-            );
-            return Outcome::Exhausted { reason };
+        // 8 and 9. persist + publish, exhausted?
+        if let Some(outcome) = persist_and_check(session, &store, &budget, info_tx) {
+            return outcome;
         }
     }
+}
+
+/// Ceiling of the one retry after a truncated reply.
+const TRUNCATED_RETRY_CAP: u32 = 65_536;
+
+fn truncated_feedback(output_tokens: u64, reasoning_tokens: u64) -> String {
+    format!(
+        "Your reply was cut at {output_tokens} output tokens ({reasoning_tokens} of reasoning) and was NOT executed. \
+         Write in several turns: one file per turn, or `fs.write` in pieces."
+    )
+}
+
+/// Steps 8 and 9 of the loop: persist, publish, and stop when the budget is spent.
+fn persist_and_check(
+    session: &mut Session,
+    store: &Store,
+    budget: &Budget,
+    info_tx: &watch::Sender<SessionInfo>,
+) -> Option<Outcome> {
+    session.meta.counters = budget.freeze();
+    if let Err(e) = session.save(store) {
+        tracing::error!(session = %session.meta.id, "save failed: {e}");
+    }
+    let _ = info_tx.send(session.info(SessionState::Running));
+    let reason = budget.exhausted()?;
+    log(
+        store,
+        session,
+        json!({"kind": "exhausted", "reason": reason}),
+    );
+    Some(Outcome::Exhausted { reason })
 }
 
 fn recoverable(e: &LlmError) -> bool {

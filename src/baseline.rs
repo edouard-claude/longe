@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::config::{Harness, ModelRef};
-use crate::llm::{ChatMessage, ChatRequest, LlmRegistry, Role};
+use crate::llm::{ChatMessage, ChatRequest, LlmError, LlmRegistry, Role};
 use crate::sandbox::{Policy, Sandbox};
 use crate::store::Store;
 
@@ -93,7 +93,30 @@ pub async fn run(
             temperature: harness.model.temperature,
             max_tokens: harness.model.max_output_tokens,
         };
-        let resp = llm.complete(&model, &req).await?;
+        let resp = match llm.complete(&model, &req).await {
+            Ok(r) => r,
+            Err(LlmError::Truncated {
+                input_tokens,
+                output_tokens,
+                reasoning_tokens,
+            }) => {
+                report.turns += 1;
+                report.tokens += input_tokens + output_tokens;
+                report.bad_turns += 1;
+                let fb = format!(
+                    "Your reply was cut at {output_tokens} output tokens ({reasoning_tokens} of reasoning) and was ignored. Write less per turn."
+                );
+                match history.last_mut() {
+                    Some(m) if m.role == Role::User => {
+                        m.content.push_str("\n\n");
+                        m.content.push_str(&fb);
+                    }
+                    _ => history.push(ChatMessage::user(fb)),
+                }
+                continue;
+            }
+            Err(e) => return Err(e.into()),
+        };
         report.turns += 1;
         report.tokens += resp.usage.total();
         history.push(ChatMessage::assistant(resp.text.clone()));

@@ -133,7 +133,9 @@ provider = "ollama"
 name = "qwen3-vl:8b"
 temperature = 0.2
 context_window = 32768
-max_output_tokens = 8192
+# Reasoning tokens count against this limit: a thinking model that spends it all on
+# reasoning returns nothing, so keep it high (the runtime retries once at twice this).
+max_output_tokens = 16384
 
 [providers.ollama]
 kind = "ollama"
@@ -582,6 +584,18 @@ mod tests {
         assert!(s.root().join(".git").exists());
         assert_eq!(s.git_current_branch().unwrap(), "main");
         assert_eq!(s.harness().unwrap().budget.min_turns, 20);
+    }
+
+    #[test]
+    fn init_template_leaves_room_for_reasoning_tokens() {
+        let (_d, s) = store();
+        let h = s.harness().unwrap();
+        assert_eq!(h.model.max_output_tokens, 16_384);
+        let text = std::fs::read_to_string(s.harness_path()).unwrap();
+        assert!(
+            text.contains("Reasoning tokens count against this limit"),
+            "the template must say why the limit is high"
+        );
     }
 
     #[test]

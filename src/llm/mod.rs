@@ -81,12 +81,14 @@ impl LlmRegistry {
                     tracing::warn!(provider = %model.provider, attempt, error = %e, "llm retry in {wait:?}");
                     tokio::time::sleep(wait).await;
                 }
-                Err(e) if attempt > 1 => {
+                Err(e) if e.is_retryable() && attempt > 1 => {
                     return Err(LlmError::Exhausted {
                         attempts: attempt,
                         last: Box::new(e),
                     })
                 }
+                // A non-retryable error keeps its own type even after retries, so the
+                // caller can match on it (`Truncated` drives the max_tokens retry).
                 Err(e) => return Err(e),
             }
         }
@@ -238,7 +240,8 @@ mod tests {
             r.usage,
             Usage {
                 input_tokens: 12,
-                output_tokens: 3
+                output_tokens: 3,
+                reasoning_tokens: 0
             }
         );
         assert_eq!(r.stop_reason.as_deref(), Some("end_turn"));
@@ -287,7 +290,8 @@ mod tests {
             r.usage,
             Usage {
                 input_tokens: 7,
-                output_tokens: 2
+                output_tokens: 2,
+                reasoning_tokens: 0
             }
         );
         assert_eq!(r.stop_reason.as_deref(), Some("stop"));
@@ -317,6 +321,137 @@ mod tests {
         assert!(r.usage_estimated);
         assert_eq!(r.usage.output_tokens, 2);
         assert!(r.usage.input_tokens > 0);
+    }
+
+    /// A reasoning model that spends the whole budget thinking: no `content`, a
+    /// stream of `reasoning_content`, then `finish_reason: "length"`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_length_stop_is_truncated_not_empty() {
+        let body = sse(&[
+            (
+                "",
+                r#"{"choices":[{"delta":{"reasoning_content":"let me think"},"finish_reason":null}]}"#,
+            ),
+            (
+                "",
+                r#"{"choices":[{"delta":{"reasoning_content":" harder"},"finish_reason":"length"}]}"#,
+            ),
+            (
+                "",
+                r#"{"choices":[],"usage":{"prompt_tokens":40,"completion_tokens":100,"completion_tokens_details":{"reasoning_tokens":100}}}"#,
+            ),
+            ("", "[DONE]"),
+        ]);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move { ([("content-type", "text/event-stream")], body) }
+            }),
+        );
+        let url = serve(app).await;
+        let reg =
+            LlmRegistry::from_harness(&harness("o", ProviderKind::Openai, &url, None)).unwrap();
+        let m = ModelRef {
+            provider: "o".into(),
+            name: "m".into(),
+        };
+        let err = reg.complete(&m, &req()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LlmError::Truncated {
+                    input_tokens: 40,
+                    output_tokens: 100,
+                    reasoning_tokens: 100
+                }
+            ),
+            "{err}"
+        );
+        assert!(!err.is_retryable());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn openai_reasoning_then_answer_counts_reasoning() {
+        let body = sse(&[
+            (
+                "",
+                r#"{"choices":[{"delta":{"reasoning_content":"hmm"},"finish_reason":null}]}"#,
+            ),
+            (
+                "",
+                r#"{"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}"#,
+            ),
+            (
+                "",
+                r#"{"choices":[],"usage":{"prompt_tokens":9,"completion_tokens":16,"completion_tokens_details":{"reasoning_tokens":14}}}"#,
+            ),
+            ("", "[DONE]"),
+        ]);
+        let app = Router::new().route(
+            "/chat/completions",
+            post(move || {
+                let body = body.clone();
+                async move { ([("content-type", "text/event-stream")], body) }
+            }),
+        );
+        let url = serve(app).await;
+        let reg =
+            LlmRegistry::from_harness(&harness("o", ProviderKind::Openai, &url, None)).unwrap();
+        let m = ModelRef {
+            provider: "o".into(),
+            name: "m".into(),
+        };
+        let r = reg.complete(&m, &req()).await.unwrap();
+        assert_eq!(r.text, "ok");
+        assert_eq!(r.reasoning_chars, 3);
+        assert_eq!(r.usage.reasoning_tokens, 14);
+        assert_eq!(r.usage.output_tokens, 16);
+        assert_eq!(r.stop_reason.as_deref(), Some("stop"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn anthropic_max_tokens_stop_is_truncated_even_with_text() {
+        let body = sse(&[
+            (
+                "message_start",
+                r#"{"type":"message_start","message":{"usage":{"input_tokens":5}}}"#,
+            ),
+            (
+                "content_block_delta",
+                r#"{"type":"content_block_delta","delta":{"type":"text_delta","text":"```lua\nfs.write('a', [[cut"}}"#,
+            ),
+            (
+                "message_delta",
+                r#"{"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":8}}"#,
+            ),
+            ("message_stop", r#"{"type":"message_stop"}"#),
+        ]);
+        let app = Router::new().route(
+            "/v1/messages",
+            post(move || {
+                let body = body.clone();
+                async move { ([("content-type", "text/event-stream")], body) }
+            }),
+        );
+        let url = serve(app).await;
+        let reg =
+            LlmRegistry::from_harness(&harness("a", ProviderKind::Anthropic, &url, None)).unwrap();
+        let m = ModelRef {
+            provider: "a".into(),
+            name: "m".into(),
+        };
+        let err = reg.complete(&m, &req()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                LlmError::Truncated {
+                    output_tokens: 8,
+                    ..
+                }
+            ),
+            "{err}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

@@ -443,6 +443,15 @@ fn render_event(e: &Value) -> String {
             "[compacted {} -> {} turns]",
             e["turns_before"], e["turns_after"]
         ),
+        "truncated" => format!(
+            "[truncated at {} tok ({} reasoning); {}]",
+            e["output_tokens"],
+            e["reasoning_tokens"],
+            e["retried_with"].as_u64().map_or_else(
+                || "fed back to the model".to_string(),
+                |m| format!("retrying with max_tokens={m}")
+            )
+        ),
         "finish" => format!("[finish] {}", e["outcome"]),
         "start" => format!("[start] model={}", e["model"]),
         other => format!("[{other}] {}", e),
