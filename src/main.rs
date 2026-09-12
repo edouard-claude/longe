@@ -439,6 +439,7 @@ fn render_event(e: &Value) -> String {
             e["ok"], e["code"], e["seconds"]
         ),
         "done_refused" => format!("[done refused] {}", e["reason"].as_str().unwrap_or("")),
+        "compact_started" => format!("[compacting {} turns...]", e["turns_before"]),
         "compact" => format!(
             "[compacted {} -> {} turns]",
             e["turns_before"], e["turns_after"]

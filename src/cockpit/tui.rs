@@ -594,6 +594,13 @@ fn event_line(e: &Value) -> Line<'static> {
                 val,
             ));
         }
+        "compact_started" => {
+            spans.push(label("compacting…", Color::Blue));
+            spans.push(Span::styled(
+                format!("{} turns, waiting for the summary", e["turns_before"]),
+                dim,
+            ));
+        }
         "compact" => {
             spans.push(label("compact", Color::Blue));
             spans.push(Span::styled(

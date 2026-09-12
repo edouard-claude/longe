@@ -2,11 +2,106 @@
 //! turns verbatim. The original task never enters the summary path: it lives in the
 //! system prompt.
 
+use std::path::Path;
+
 use crate::config::ModelRef;
 use crate::llm::{ChatMessage, ChatRequest, LlmError, LlmRegistry, Role};
-use crate::session::state::Turn;
+use crate::session::state::{Note, Turn};
+use crate::verify::VerifyOutcome;
 
 pub const SUMMARY_PREFIX: &str = "[compacted context]";
+
+/// Output limit of the compaction call: a summary is short by construction.
+pub const MAX_TOKENS: u32 = 4096;
+/// Word targets of the first prompt and of the retry after a truncated summary.
+const WORDS: u32 = 1200;
+const WORDS_SHORT: u32 = 600;
+/// Lines of the last verifier report and of `git status` handed to the compactor.
+const VERIFY_LINES: usize = 20;
+const STATUS_LINES: usize = 40;
+
+/// What the runtime knows for certain at compaction time. Handed to the model so
+/// the summary does not guess at it (a summary once claimed that Lua helpers do
+/// not persist across turns, and the agent believed it).
+#[derive(Debug, Clone, Default)]
+pub struct RuntimeFacts {
+    /// Live Lua globals with their serialized size.
+    pub globals: Vec<(String, usize)>,
+    pub last_verify: Option<VerifyOutcome>,
+    pub notes: Vec<Note>,
+    /// `git status --short` of the workspace; `None` when it is not a repository.
+    pub changed_files: Option<String>,
+}
+
+/// `git status --short` of `ws`, capped, or `None` outside a repository.
+pub fn git_status_short(ws: &Path) -> Option<String> {
+    let out = std::process::Command::new("git")
+        .args(["-C", &ws.to_string_lossy(), "status", "--short"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = text.lines().collect();
+    let mut s = lines
+        .iter()
+        .take(STATUS_LINES)
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if lines.len() > STATUS_LINES {
+        s.push_str(&format!("\n... and {} more", lines.len() - STATUS_LINES));
+    }
+    Some(s)
+}
+
+/// The facts as a prompt section.
+pub fn facts_preamble(f: &RuntimeFacts) -> String {
+    let mut s = String::from(
+        "## Runtime facts (known to the runtime, they persist: do not describe them)\n",
+    );
+    if f.globals.is_empty() {
+        s.push_str("Lua globals alive: none\n");
+    } else {
+        let list: Vec<String> = f
+            .globals
+            .iter()
+            .map(|(n, b)| format!("{n} ({b} B)"))
+            .collect();
+        s.push_str(&format!(
+            "Lua globals alive (they survive turns and restarts): {}\n",
+            list.join(", ")
+        ));
+    }
+    match &f.last_verify {
+        None => s.push_str("Last verify(): never run\n"),
+        Some(v) => {
+            let head: Vec<&str> = v.report.lines().take(VERIFY_LINES).collect();
+            s.push_str(&format!(
+                "Last verify(): {} (exit {}, {}s); report head:\n{}\n",
+                if v.ok { "OK" } else { "FAILED" },
+                v.code,
+                v.seconds,
+                head.join("\n")
+            ));
+        }
+    }
+    if f.notes.is_empty() {
+        s.push_str("Notes: none\n");
+    } else {
+        s.push_str("Notes (shown to the agent every turn):\n");
+        for n in &f.notes {
+            s.push_str(&format!("- t{}: {}\n", n.turn, n.text.replace('\n', " ")));
+        }
+    }
+    match &f.changed_files {
+        None => s.push_str("Workspace: not a git repository\n"),
+        Some(st) if st.trim().is_empty() => s.push_str("Workspace (git status --short): clean\n"),
+        Some(st) => s.push_str(&format!("Workspace (git status --short):\n{st}\n")),
+    }
+    s
+}
 
 fn render_turns(turns: &[Turn]) -> String {
     let mut s = String::new();
@@ -20,43 +115,77 @@ fn render_turns(turns: &[Turn]) -> String {
     s
 }
 
-/// Ask the model for a structured summary of `older`.
+fn prompt(task: &str, hint: &str, facts: &str, transcript: &str, words: u32) -> String {
+    let hint_line = if hint.trim().is_empty() {
+        String::new()
+    } else {
+        format!("\nThe agent asked to keep in mind: {hint}\n")
+    };
+    format!(
+        "You are compacting the working memory of an autonomous coding agent so it can continue.\n\
+         The task (already known to the agent, do not restate it in full): {task}\n{hint_line}\n\
+         {facts}\n\
+         Write a dense, factual summary under {words} words with these sections, markdown headings, no fluff:\n\
+         1. Progress so far (what exists, what works, verified how)\n\
+         2. Workspace state (files/modules created, their roles, key functions and data structures)\n\
+         3. Open problems and failing cases (exact errors, failing test names)\n\
+         4. Decisions and lessons (what was tried and rejected, gotchas)\n\
+         5. Next steps (concrete, ordered)\n\
+         Do not describe the runtime or the Lua state: they are given above and persist. \
+         Summarize decisions, errors seen and next steps only.\n\
+         Keep every identifier, path, command and number that would be costly to rediscover.\n\n\
+         TRANSCRIPT:\n{transcript}"
+    )
+}
+
+/// A compaction summary and how it was obtained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Summary {
+    pub text: String,
+    /// The first call hit `max_tokens`; this text comes from the shorter retry.
+    pub shortened: bool,
+}
+
+/// Ask the model for a structured summary of `older`. A summary cut at
+/// `MAX_TOKENS` is useless (it ends mid-list), so it is asked again, shorter.
 pub async fn summarize(
     llm: &LlmRegistry,
     model: &ModelRef,
     task: &str,
     older: &[Turn],
     hint: &str,
-    max_tokens: u32,
-) -> Result<String, LlmError> {
+    facts: &RuntimeFacts,
+) -> Result<Summary, LlmError> {
     let transcript = render_turns(older);
-    let hint_line = if hint.trim().is_empty() {
-        String::new()
-    } else {
-        format!("\nThe agent asked to keep in mind: {hint}\n")
-    };
-    let prompt = format!(
-        "You are compacting the working memory of an autonomous coding agent so it can continue.\n\
-         The task (already known to the agent, do not restate it in full): {task}\n{hint_line}\n\
-         Write a dense, factual summary with these sections, markdown headings, no fluff:\n\
-         1. Progress so far (what exists, what works, verified how)\n\
-         2. Workspace state (files/modules created, their roles, key functions and data structures)\n\
-         3. Lua state (globals and helpers the agent defined and relies on)\n\
-         4. Open problems and failing cases (exact errors, failing test names)\n\
-         5. Decisions and lessons (what was tried and rejected, gotchas)\n\
-         6. Next steps (concrete, ordered)\n\
-         Keep every identifier, path, command and number that would be costly to rediscover.\n\n\
-         TRANSCRIPT:\n{transcript}"
-    );
-    let req = ChatRequest {
+    let preamble = facts_preamble(facts);
+    let ask = |words: u32| ChatRequest {
         model: model.name.clone(),
         system: "You compress agent transcripts into precise working notes.".into(),
-        messages: vec![ChatMessage::user(prompt)],
+        messages: vec![ChatMessage::user(prompt(
+            task,
+            hint,
+            &preamble,
+            &transcript,
+            words,
+        ))],
         temperature: 0.0,
-        max_tokens,
+        max_tokens: MAX_TOKENS,
     };
-    let resp = llm.complete(model, &req).await?;
-    Ok(crate::parse::strip_thinking(&resp.text).trim().to_string())
+    let clean = |text: &str| crate::parse::strip_thinking(text).trim().to_string();
+    match llm.complete(model, &ask(WORDS)).await {
+        Ok(r) => Ok(Summary {
+            text: clean(&r.text),
+            shortened: false,
+        }),
+        Err(LlmError::Truncated { .. }) => {
+            let r = llm.complete(model, &ask(WORDS_SHORT)).await?;
+            Ok(Summary {
+                text: clean(&r.text),
+                shortened: true,
+            })
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// Build the compacted history from a summary. Pure, so it is unit-testable.
@@ -134,6 +263,58 @@ mod tests {
         for w in out.windows(2) {
             assert_ne!(w[0].role, w[1].role);
         }
+    }
+
+    #[test]
+    fn preamble_states_globals_verify_notes_and_workspace() {
+        let empty = facts_preamble(&RuntimeFacts::default());
+        assert!(empty.contains("Lua globals alive: none"));
+        assert!(empty.contains("Last verify(): never run"));
+        assert!(empty.contains("Notes: none"));
+        assert!(empty.contains("not a git repository"));
+        let f = RuntimeFacts {
+            globals: vec![("walk".into(), 120), ("cache".into(), 4096)],
+            last_verify: Some(VerifyOutcome {
+                ok: false,
+                code: 1,
+                report: (1..=30)
+                    .map(|i| format!("case {i} failed"))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                seconds: 12,
+                timed_out: false,
+            }),
+            notes: vec![Note {
+                turn: 34,
+                text: "tier1: xxtea\nthen aes".into(),
+            }],
+            changed_files: Some(" M src/lib.rs\n?? src/crypto/".into()),
+        };
+        let p = facts_preamble(&f);
+        assert!(p.contains("walk (120 B), cache (4096 B)"), "{p}");
+        assert!(p.contains("they survive turns and restarts"));
+        assert!(p.contains("Last verify(): FAILED (exit 1, 12s)"));
+        assert!(
+            p.contains("case 20 failed") && !p.contains("case 21 failed"),
+            "20 lines"
+        );
+        assert!(p.contains("- t34: tier1: xxtea then aes"));
+        assert!(p.contains("?? src/crypto/"));
+        let clean = facts_preamble(&RuntimeFacts {
+            changed_files: Some("\n".into()),
+            ..RuntimeFacts::default()
+        });
+        assert!(clean.contains("clean"));
+        let text = prompt("T", "", &p, "X", 1200);
+        assert!(text.contains("under 1200 words"));
+        assert!(text.contains("Do not describe the runtime or the Lua state"));
+        assert!(text.contains("walk (120 B)"));
+    }
+
+    #[test]
+    fn git_status_is_none_outside_a_repository() {
+        let d = tempfile::tempdir().unwrap();
+        assert_eq!(git_status_short(d.path()), None);
     }
 
     #[test]

@@ -27,6 +27,8 @@ struct Fake {
     /// Every request, in order.
     requests: Mutex<Vec<SeenRequest>>,
     prompt_tokens: Mutex<u64>,
+    /// Compaction requests still to answer with a truncated (`length`) reply.
+    compact_cuts: Mutex<u32>,
 }
 
 fn session_name(system: &str) -> String {
@@ -60,7 +62,13 @@ async fn handler(
         .lock()
         .push((model, system.clone(), history, max_tokens));
     let reply = if system.starts_with("You compress") {
-        "## Progress\nSUMMARY OF OLDER TURNS\n## Next steps\ncontinue".to_string()
+        let mut cuts = fake.compact_cuts.lock();
+        if *cuts > 0 {
+            *cuts -= 1;
+            "@length".to_string()
+        } else {
+            "## Progress\nSUMMARY OF OLDER TURNS\n## Next steps\ncontinue".to_string()
+        }
     } else if system.starts_with("You improve the harness") {
         json!({"analysis": "fine", "changes": [{"path": "skills/e2e.md", "content": "# e2e skill\nwrite tests first"}]}).to_string()
     } else {
@@ -601,6 +609,58 @@ async fn three_unverified_source_writes_earn_a_verify_reminder() {
         !feedback(5).contains(NAG),
         "one write since: {}",
         feedback(5)
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_gets_runtime_facts_and_retries_shorter_when_cut() {
+    let mut w = world(|h| {
+        h.model.context_window = 100;
+        h.compact.keep_last = 2;
+    })
+    .await;
+    *w.fake.prompt_tokens.lock() = 90;
+    *w.fake.compact_cuts.lock() = 1;
+    w.script(
+        "root",
+        &[
+            &lua("alpha_global = 'kept'; note('remember the plan')"),
+            &lua("b = 2"),
+            &lua("done('ok')"),
+        ],
+    );
+    let id = w.spawn("root", "facts first").await;
+    assert!(matches!(w.wait_finish(&id).await, Outcome::Done { .. }));
+    let ev = w.events(&id);
+    let started = ev
+        .iter()
+        .position(|e| e["kind"] == "compact_started")
+        .expect("compact_started event");
+    let compacted = ev
+        .iter()
+        .position(|e| e["kind"] == "compact")
+        .expect("compact event");
+    assert!(started < compacted, "{ev:?}");
+    assert_eq!(ev[compacted]["shortened"], true, "{:?}", ev[compacted]);
+    assert!(!ev.iter().any(|e| e["kind"] == "compact_failed"), "{ev:?}");
+    let reqs = w.fake.requests.lock();
+    let compactions: Vec<&SeenRequest> = reqs
+        .iter()
+        .filter(|r| r.1.starts_with("You compress"))
+        .collect();
+    assert!(compactions.len() >= 2, "{}", compactions.len());
+    let first = compactions[0].2[0]["content"].as_str().unwrap();
+    let second = compactions[1].2[0]["content"].as_str().unwrap();
+    assert!(first.contains("under 1200 words"), "{first}");
+    assert!(second.contains("under 600 words"), "{second}");
+    assert_eq!(compactions[0].3, 4096, "compaction max_tokens");
+    // The runtime facts: live globals, the note, the instruction not to guess.
+    assert!(first.contains("alpha_global"), "{first}");
+    assert!(first.contains("remember the plan"), "{first}");
+    assert!(first.contains("Last verify(): never run"), "{first}");
+    assert!(
+        first.contains("Do not describe the runtime or the Lua state"),
+        "{first}"
     );
 }
 

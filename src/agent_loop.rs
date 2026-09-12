@@ -618,23 +618,44 @@ async fn try_finish(
     }
 }
 
+/// What the runtime knows at compaction time, for the compactor's preamble.
+fn runtime_facts(session: &Session) -> compact::RuntimeFacts {
+    compact::RuntimeFacts {
+        globals: session
+            .repl
+            .as_ref()
+            .map(Repl::globals_summary)
+            .unwrap_or_default(),
+        last_verify: session.meta.last_verify.clone(),
+        notes: session.meta.notes.iter().cloned().collect(),
+        changed_files: tokio::task::block_in_place(|| {
+            compact::git_status_short(&session.meta.workspace)
+        }),
+    }
+}
+
 async fn compact_now(session: &mut Session, deps: &Arc<LoopDeps>, hint: &str) {
     let keep = deps.harness.compact.keep_last;
     let older = compact::split_older(&session.history, keep);
     if older.len() < 2 {
         return;
     }
+    let before = session.history.len();
+    log(
+        &deps.store,
+        session,
+        json!({"kind": "compact_started", "turns_before": before, "summarizing": older.len()}),
+    );
     let model = session.meta.model.clone();
-    let max = deps.harness.model.max_output_tokens.min(4096);
-    match compact::summarize(&deps.llm, &model, &session.meta.task, older, hint, max).await {
+    let facts = runtime_facts(session);
+    match compact::summarize(&deps.llm, &model, &session.meta.task, older, hint, &facts).await {
         Ok(summary) => {
-            let before = session.history.len();
-            session.history = compact::rebuild(&session.history, &summary, keep);
+            session.history = compact::rebuild(&session.history, &summary.text, keep);
             session.meta.compactions += 1;
             log(
                 &deps.store,
                 session,
-                json!({"kind": "compact", "turns_before": before, "turns_after": session.history.len(), "summary": summary}),
+                json!({"kind": "compact", "turns_before": before, "turns_after": session.history.len(), "summary": summary.text, "shortened": summary.shortened}),
             );
         }
         Err(e) => {
