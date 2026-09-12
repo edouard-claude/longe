@@ -338,7 +338,10 @@ compact(hint) | verify() -> {ok, report} | note(s) | done(summary)
 ```
 
 Output over `[repl] max_output_bytes` (8 KB by default, 16 KB from `longe init`) is cut
-after its head and kept whole in `_last`. Globals persist; the serialized
+after its head and kept whole in `_last`. Once a read-only exec (reads, listings,
+`fs.lines`, `fs.grep`, a read-only `sh`) is older than `[compact] keep_last` turns, its
+output is replaced in the context by a one-line stub; the disk keeps it and a read is
+replayable. Globals persist; the serialized
 size and the largest globals are shown to the model so it can garbage-collect its own
 state.
 

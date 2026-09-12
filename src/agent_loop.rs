@@ -23,7 +23,7 @@ use crate::llm::{ChatMessage, ChatRequest, LlmError, LlmRegistry, Role};
 use crate::parse::{self, Action};
 use crate::repl::{bindings::REFERENCE, Effects, Repl, ReplCtx};
 use crate::sandbox::{Policy, Sandbox};
-use crate::session::state::{Note, Session};
+use crate::session::state::{Note, Session, TurnKind};
 use crate::session::{now_rfc3339, Ctl, Outcome, SessionInfo, SessionState, TreeHandle};
 use crate::store::Store;
 
@@ -166,18 +166,25 @@ fn build_system(deps: &LoopDeps, session: &Session, budget: &Budget, repl: &Repl
     s
 }
 
-/// Alternate roles strictly (providers reject two consecutive user turns).
-fn compile_messages(session: &Session) -> Vec<ChatMessage> {
+/// Alternate roles strictly (providers reject two consecutive user turns). Read
+/// outputs older than the last `keep_last` turns are replaced by a stub: the
+/// context is working memory, the disk keeps the text, a read is replayable.
+fn compile_messages(session: &Session, keep_last: usize) -> Vec<ChatMessage> {
+    // The latest feedback is always shown whole, whatever `keep_last` says.
+    let older = compact::split_older(&session.history, keep_last)
+        .len()
+        .min(session.history.len().saturating_sub(1));
     let mut out: Vec<ChatMessage> = Vec::with_capacity(session.history.len());
-    for t in &session.history {
+    for (i, t) in session.history.iter().enumerate() {
+        let content = t.view(i < older);
         match out.last_mut() {
             Some(last) if last.role == t.role => {
                 last.content.push_str("\n\n");
-                last.content.push_str(&t.content);
+                last.content.push_str(&content);
             }
             _ => out.push(ChatMessage {
                 role: t.role,
-                content: t.content.clone(),
+                content: content.into_owned(),
             }),
         }
     }
@@ -320,7 +327,7 @@ async fn run_inner(
         let req = ChatRequest {
             model: session.meta.model.name.clone(),
             system,
-            messages: compile_messages(session),
+            messages: compile_messages(session, deps.harness.compact.keep_last),
             temperature: deps.harness.model.temperature,
             max_tokens,
         };
@@ -438,7 +445,12 @@ async fn run_inner(
                     &mut done_request,
                 )
                 .await;
-                session.push_turn(Role::User, feedback);
+                let kind = if compact::is_read_only_exec(&code) {
+                    TurnKind::ReadOutput
+                } else {
+                    TurnKind::Durable
+                };
+                session.push_turn_kind(Role::User, feedback, kind);
             }
             Action::Done(summary) => done_request = Some(summary),
             Action::Text(_) => {

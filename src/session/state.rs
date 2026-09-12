@@ -1,6 +1,7 @@
 //! One session's persistent state: metadata, L1 history, and (lazily) its Lua VM.
 //! Everything is written under `sessions/<id>/` every turn.
 
+use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
@@ -14,11 +15,42 @@ use crate::repl::Repl;
 use crate::store::{write_atomic, Store, StoreError};
 use crate::verify::VerifyOutcome;
 
+/// Whether a turn's text must stay in the model's view once it is old.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TurnKind {
+    #[default]
+    Durable,
+    /// Output of a read-only exec: replayable, so an old one is elided from the
+    /// context and kept on disk only.
+    ReadOutput,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Turn {
     pub role: Role,
     pub content: String,
     pub ts: String,
+    /// Turn counter when the entry was made (0 in histories written before it).
+    #[serde(default)]
+    pub turn: u32,
+    #[serde(default)]
+    pub kind: TurnKind,
+}
+
+impl Turn {
+    /// The text the model sees: the content, or a stub for an old read output.
+    pub fn view(&self, old: bool) -> Cow<'_, str> {
+        if old && self.kind == TurnKind::ReadOutput {
+            Cow::Owned(format!(
+                "[read output elided ({} bytes, turn {}); re-read if needed]",
+                self.content.len(),
+                self.turn
+            ))
+        } else {
+            Cow::Borrowed(&self.content)
+        }
+    }
 }
 
 /// One `note()` call, shown back to the model with the turn it was made on.
@@ -118,10 +150,16 @@ impl Session {
     }
 
     pub fn push_turn(&mut self, role: Role, content: impl Into<String>) {
+        self.push_turn_kind(role, content, TurnKind::Durable);
+    }
+
+    pub fn push_turn_kind(&mut self, role: Role, content: impl Into<String>, kind: TurnKind) {
         self.history.push(Turn {
             role,
             content: content.into(),
             ts: now_rfc3339(),
+            turn: self.meta.counters.turns,
+            kind,
         });
     }
 
@@ -318,6 +356,31 @@ mod tests {
         )
         .unwrap();
         assert!(meta.notes.is_empty());
+    }
+
+    #[test]
+    fn old_read_outputs_are_viewed_as_a_stub() {
+        let t = Turn {
+            role: Role::User,
+            content: "x".repeat(2800),
+            ts: String::new(),
+            turn: 18,
+            kind: TurnKind::ReadOutput,
+        };
+        assert_eq!(t.view(false), t.content);
+        assert_eq!(
+            t.view(true),
+            "[read output elided (2800 bytes, turn 18); re-read if needed]"
+        );
+        let durable = Turn {
+            kind: TurnKind::Durable,
+            ..t
+        };
+        assert_eq!(durable.view(true), durable.content);
+        // Histories written before `turn` and `kind` existed still load.
+        let old: Turn = serde_json::from_str(r#"{"role":"user","content":"c","ts":""}"#).unwrap();
+        assert_eq!(old.kind, TurnKind::Durable);
+        assert_eq!(old.turn, 0);
     }
 
     #[test]

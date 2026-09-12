@@ -6,7 +6,7 @@ use std::path::Path;
 
 use crate::config::ModelRef;
 use crate::llm::{ChatMessage, ChatRequest, LlmError, LlmRegistry, Role};
-use crate::session::state::{Note, Turn};
+use crate::session::state::{Note, Turn, TurnKind};
 use crate::verify::VerifyOutcome;
 
 pub const SUMMARY_PREFIX: &str = "[compacted context]";
@@ -103,6 +103,8 @@ pub fn facts_preamble(f: &RuntimeFacts) -> String {
     s
 }
 
+/// The older turns as a transcript. Read outputs are elided here too: the
+/// compactor summarizes decisions, not the files the agent once printed.
 fn render_turns(turns: &[Turn]) -> String {
     let mut s = String::new();
     for t in turns {
@@ -110,7 +112,7 @@ fn render_turns(turns: &[Turn]) -> String {
             Role::User => "RUNTIME",
             Role::Assistant => "AGENT",
         };
-        s.push_str(&format!("### {who}\n{}\n\n", t.content));
+        s.push_str(&format!("### {who}\n{}\n\n", t.view(true)));
     }
     s
 }
@@ -188,6 +190,195 @@ pub async fn summarize(
     }
 }
 
+/// Bindings and library calls whose only effect is their output.
+const READ_CALLS: &[&str] = &[
+    "fs.read",
+    "fs.list",
+    "fs.lines",
+    "fs.grep",
+    "print",
+    "tostring",
+    "tonumber",
+    "type",
+    "ipairs",
+    "pairs",
+    "next",
+    "select",
+    "table.concat",
+    "table.insert",
+    "table.sort",
+    "table.unpack",
+    "os.date",
+    "os.time",
+    "os.clock",
+    "mem.get",
+    "mem.list",
+    "mem.search",
+    "skill.get",
+    "skill.list",
+    "subagent.get",
+    "subagent.list",
+    "prompt.get",
+    "agent.list",
+    "agent.id",
+];
+const READ_CALL_PREFIXES: &[&str] = &["string.", "math.", "utf8."];
+const LUA_KEYWORDS: &[&str] = &[
+    "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if", "in",
+    "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
+];
+/// Shell commands that only read; `sed`, `find` and `git` are checked by argument.
+const READ_SHELL: &[&str] = &[
+    "cat", "grep", "rg", "ls", "head", "tail", "wc", "tree", "stat", "file", "du", "pwd", "which",
+    "echo", "cd", "true", "sort", "uniq", "cut", "tr", "nl", "diff", "cmp", "od", "xxd", "hexdump",
+    "basename", "dirname", "realpath", "test", "[",
+];
+
+fn is_read_call(name: &str) -> bool {
+    READ_CALLS.contains(&name) || READ_CALL_PREFIXES.iter().any(|p| name.starts_with(p))
+}
+
+/// Every command of a shell line (split on pipes, `;`, `&&`, newlines) only reads.
+fn shell_is_read_only(cmd: &str) -> bool {
+    if cmd.contains('>') || cmd.contains("$(") || cmd.contains('`') || cmd.contains("<(") {
+        return false;
+    }
+    cmd.split(['|', ';', '&', '\n'])
+        .map(str::trim)
+        .filter(|seg| !seg.is_empty())
+        .all(|seg| {
+            let mut words = seg.split_whitespace();
+            let Some(first) = words.next() else {
+                return true;
+            };
+            let args: Vec<&str> = words.collect();
+            match first {
+                "sed" => {
+                    args.iter().any(|a| a.starts_with("-n") || *a == "--quiet")
+                        && !args
+                            .iter()
+                            .any(|a| a.starts_with("-i") || *a == "--in-place")
+                }
+                "find" => !args
+                    .iter()
+                    .any(|a| matches!(*a, "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir")),
+                "git" => matches!(
+                    args.first().copied(),
+                    Some(
+                        "status"
+                            | "log"
+                            | "diff"
+                            | "show"
+                            | "ls-files"
+                            | "grep"
+                            | "branch"
+                            | "rev-parse"
+                            | "blame"
+                    )
+                ),
+                w => READ_SHELL.contains(&w),
+            }
+        })
+}
+
+/// Length of a Lua long bracket `[=*[ ... ]=*]` starting at `s`, if one starts there.
+fn long_bracket_len(s: &str) -> Option<usize> {
+    let rest = s.strip_prefix('[')?;
+    let level = rest.bytes().take_while(|b| *b == b'=').count();
+    let rest = rest[level..].strip_prefix('[')?;
+    let close = format!("]{}]", "=".repeat(level));
+    let end = rest.find(&close).map_or(rest.len(), |i| i + close.len());
+    Some(1 + level + 1 + end)
+}
+
+/// Length of a quoted string starting at `s` (quote included), escapes honoured.
+fn quoted_len(s: &str) -> usize {
+    let b = s.as_bytes();
+    let q = b[0];
+    let mut i = 1;
+    while i < b.len() {
+        match b[i] {
+            b'\\' => i += 2,
+            c if c == q => return i + 1,
+            _ => i += 1,
+        }
+    }
+    b.len()
+}
+
+/// The first argument of a call whose text starts at `s` (just after the callee),
+/// when it is a string literal.
+fn first_string_arg(s: &str) -> Option<String> {
+    let t = s.trim_start();
+    let t = t.strip_prefix('(').map_or(t, str::trim_start);
+    if t.starts_with('"') || t.starts_with('\'') {
+        let n = quoted_len(t);
+        return Some(t[1..n.saturating_sub(1).max(1)].to_string());
+    }
+    if let Some(n) = long_bracket_len(t) {
+        let level = t[1..].bytes().take_while(|b| *b == b'=').count();
+        let open = 2 + level;
+        let close = n.saturating_sub(open).max(open);
+        return Some(t[open..close].to_string());
+    }
+    None
+}
+
+/// Whether an exec only reads: every call is a read-only binding or library
+/// function, and every `sh` runs a read-only command given as a literal. The
+/// output of such a turn is replayable, so it need not stay in the context.
+pub fn is_read_only_exec(code: &str) -> bool {
+    let b = code.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c == b'-' && b.get(i + 1) == Some(&b'-') {
+            i += 2 + long_bracket_len(&code[i + 2..])
+                .unwrap_or_else(|| code[i + 2..].find('\n').unwrap_or(code.len() - i - 2));
+            continue;
+        }
+        if c == b'"' || c == b'\'' {
+            i += quoted_len(&code[i..]);
+            continue;
+        }
+        if c == b'[' {
+            if let Some(n) = long_bracket_len(&code[i..]) {
+                i += n;
+                continue;
+            }
+        }
+        if c.is_ascii_alphabetic() || c == b'_' {
+            let start = i;
+            while i < b.len() && (b[i].is_ascii_alphanumeric() || b[i] == b'_' || b[i] == b'.') {
+                i += 1;
+            }
+            let name = &code[start..i];
+            let rest = code[i..].trim_start();
+            let is_call = rest.starts_with('(')
+                || rest.starts_with('{')
+                || rest.starts_with('"')
+                || rest.starts_with('\'')
+                || rest.starts_with("[[")
+                || rest.starts_with("[=");
+            let is_method = code[..start].trim_end().ends_with(':');
+            if !is_call || is_method || LUA_KEYWORDS.contains(&name) {
+                continue;
+            }
+            if name == "sh" {
+                match first_string_arg(&code[i..]) {
+                    Some(cmd) if shell_is_read_only(&cmd) => {}
+                    _ => return false,
+                }
+            } else if !is_read_call(name) {
+                return false;
+            }
+            continue;
+        }
+        i += 1;
+    }
+    true
+}
+
 /// Build the compacted history from a summary. Pure, so it is unit-testable.
 pub fn rebuild(history: &[Turn], summary: &str, keep_last: usize) -> Vec<Turn> {
     let mut keep_from = history.len().saturating_sub(keep_last);
@@ -196,16 +387,21 @@ pub fn rebuild(history: &[Turn], summary: &str, keep_last: usize) -> Vec<Turn> {
         keep_from += 1;
     }
     let mut out = Vec::with_capacity(history.len() - keep_from + 2);
+    let turn = history.last().map_or(0, |t| t.turn);
     out.push(Turn {
         role: Role::User,
         content: format!("{SUMMARY_PREFIX}\n{summary}\n\nContinue from here."),
         ts: crate::session::now_rfc3339(),
+        turn,
+        kind: TurnKind::Durable,
     });
     if keep_from < history.len() {
         out.push(Turn {
             role: Role::Assistant,
             content: "Understood. Continuing with the recent turns below.".into(),
             ts: crate::session::now_rfc3339(),
+            turn,
+            kind: TurnKind::Durable,
         });
         out.extend_from_slice(&history[keep_from..]);
     }
@@ -230,6 +426,8 @@ mod tests {
             role,
             content: s.into(),
             ts: String::new(),
+            turn: 0,
+            kind: TurnKind::Durable,
         }
     }
 
@@ -309,6 +507,47 @@ mod tests {
         assert!(text.contains("under 1200 words"));
         assert!(text.contains("Do not describe the runtime or the Lua state"));
         assert!(text.contains("walk (120 B)"));
+    }
+
+    #[test]
+    fn read_only_execs_are_told_from_mutating_ones() {
+        let reads = [
+            "print(fs.read('docs/a.md'))",
+            "s = fs.read('x'); print(s:sub(1, 9000))",
+            "for _, f in ipairs(fs.list('src')) do print(f) end",
+            "print(fs.lines('a.rs', 1, 50)); print(fs.grep('TODO', 'src'))",
+            "print(sh([[sed -n '1,40p' src/lib.rs | head -20]]).stdout)",
+            "print(sh([[git status --short && git diff --stat]]).stdout)",
+            "-- fs.write only in a comment\nprint(fs.list('.'))",
+            "print(\"fs.write is just a string here\")",
+            "r = sh('cat Cargo.toml'); print(#r.stdout, r.stdout:match('name = \"(.-)\"'))",
+            "print(string.rep('-', 10), table.concat(fs.list('.'), ', '))",
+            "print(\"é\" .. fs.read('résumé.md')) -- ç à\nprint([[ü]])",
+        ];
+        for code in reads {
+            assert!(is_read_only_exec(code), "should be a read: {code}");
+        }
+        let mutations = [
+            "fs.write('src/a.rs', [==[fn main() {}]==])",
+            "print(sh('cargo build 2>&1').stdout)",
+            "r = sh(\"cat x > y\")",
+            "note('plan'); print(fs.read('a'))",
+            "print(walk('src'))",
+            "verify()",
+            "local r = sh({'ls'})",
+            "sh(cmd)",
+            "print(sh('sed -i s/a/b/ x').stdout)",
+            "print(sh('find . -name x -delete').stdout)",
+            "m = agent.recv(); print(#m)",
+            "print(sh('ls; rm -rf target').stdout)",
+            "mem.set('k', fs.read('a'))",
+        ];
+        for code in mutations {
+            assert!(!is_read_only_exec(code), "should not be a read: {code}");
+        }
+        assert!(shell_is_read_only("ls -la | wc -l"));
+        assert!(!shell_is_read_only("echo $(rm x)"));
+        assert!(!shell_is_read_only("FOO=1 cat x"));
     }
 
     #[test]

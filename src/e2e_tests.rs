@@ -665,6 +665,68 @@ async fn compaction_gets_runtime_facts_and_retries_shorter_when_cut() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn old_read_outputs_are_elided_from_the_context_but_kept_on_disk() {
+    let mut w = world(|h| h.compact.keep_last = 2).await;
+    std::fs::write(w.ws.join("big.md"), "BIGFILEMARKER ".repeat(200)).unwrap();
+    w.script(
+        "root",
+        &[
+            &lua("print(fs.read('big.md'))"),
+            &lua("fs.write('src/a.rs', 'fn a() {}')"),
+            &lua("x = 1"),
+            &lua("y = 2"),
+            &lua("done('ok')"),
+        ],
+    );
+    let id = w.spawn("root", "read then work").await;
+    assert!(matches!(w.wait_finish(&id).await, Outcome::Done { .. }));
+    let reqs = w.fake.requests.lock();
+    let history = |k: usize| -> String {
+        reqs[k]
+            .2
+            .iter()
+            .map(|m| m["content"].as_str().unwrap_or("").to_string())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    // Right after the read, the model sees the text.
+    assert!(history(1).contains("BIGFILEMARKER"), "{}", history(1));
+    assert!(!history(1).contains("read output elided"));
+    // Once the read is older than keep_last, only the stub remains, and the
+    // request is smaller than the one right after the read despite more turns.
+    let last = reqs.len() - 1;
+    assert!(
+        !history(last).contains("BIGFILEMARKER"),
+        "{}",
+        history(last)
+    );
+    assert!(
+        history(last).contains("[read output elided (2800 bytes, turn 1); re-read if needed]"),
+        "{}",
+        history(last)
+    );
+    assert!(history(last).len() < history(1).len());
+    // A write turn is durable: its feedback stays.
+    assert!(
+        history(last).contains("true"),
+        "fs.write feedback kept: {}",
+        history(last)
+    );
+    drop(reqs);
+    let session = crate::session::state::Session::load(&w.store, &id).unwrap();
+    let read = session
+        .history
+        .iter()
+        .find(|t| t.kind == crate::session::state::TurnKind::ReadOutput)
+        .expect("the read turn is tagged");
+    assert!(
+        read.content.contains("BIGFILEMARKER"),
+        "the disk keeps the text"
+    );
+    assert_eq!(read.turn, 1);
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn pause_resume_kill() {
     let mut w = world(|h| h.budget.max_turns = 1000).await;
     // Default script: infinite ticks.
