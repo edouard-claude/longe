@@ -1,6 +1,7 @@
-//! Turn a model response into an action. The protocol is text: one or more fenced
-//! code blocks are Lua to execute; a bare `done("...")` is a completion request;
-//! anything else is prose, which the loop bounces back.
+//! Turn a model response into an action. The protocol is text: the first fenced
+//! code block is Lua to execute (later ones are ignored and counted); a bare
+//! `done("...")` is a completion request; anything else is prose, which the loop
+//! bounces back.
 
 /// What the model asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,30 +116,36 @@ fn bare_done(s: &str) -> Option<String> {
     Some(unq.to_string())
 }
 
-/// A parsed reply: the action, plus the leaked tags the loop should record.
+/// A parsed reply: the action, plus what the loop should tell or record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Parsed {
     pub action: Action,
     pub leaked: Vec<&'static str>,
+    /// Code blocks after the first one: not executed, reported in the feedback.
+    pub ignored_blocks: usize,
 }
 
 pub fn parse(resp: &str) -> Parsed {
     let Stripped { text, leaked } = strip_leaked_tags(resp);
+    let (action, ignored_blocks) = parse_clean(&text);
     Parsed {
-        action: parse_clean(&text),
+        action,
         leaked,
+        ignored_blocks,
     }
 }
 
-fn parse_clean(clean: &str) -> Action {
-    let blocks = fenced_blocks(clean);
-    if !blocks.is_empty() {
-        return Action::Exec(blocks.join("\n"));
+fn parse_clean(clean: &str) -> (Action, usize) {
+    let mut blocks = fenced_blocks(clean).into_iter();
+    if let Some(first) = blocks.next() {
+        // One block per turn: a second block is usually a retry of the first
+        // (after a hallucinated reminder), and running both doubles every effect.
+        return (Action::Exec(first), blocks.count());
     }
     if let Some(summary) = bare_done(clean) {
-        return Action::Done(summary);
+        return (Action::Done(summary), 0);
     }
-    Action::Text(clean.trim().to_string())
+    (Action::Text(clean.trim().to_string()), 0)
 }
 
 #[cfg(test)]
@@ -155,9 +162,14 @@ mod tests {
     }
 
     #[test]
-    fn multiple_blocks_are_joined_in_order() {
-        let r = "```lua\na = 1\n```\ntext\n```\nb = 2\n```";
-        assert_eq!(parse(r).action, Action::Exec("a = 1\n\nb = 2\n".into()));
+    fn only_first_block_is_executed() {
+        let r = "```lua\na = 1\n```\ntext\n```\nb = 2\n```\n```lua\nc = 3\n```";
+        let p = parse(r);
+        assert_eq!(p.action, Action::Exec("a = 1\n".into()));
+        assert_eq!(p.ignored_blocks, 2);
+        assert_eq!(parse("```lua\nx\n```").ignored_blocks, 0);
+        // Skipped tags (json, text, ...) are not code blocks, so not "ignored".
+        assert_eq!(parse("```lua\nx\n```\n```json\n{}\n```").ignored_blocks, 0);
     }
 
     #[test]

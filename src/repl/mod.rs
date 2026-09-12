@@ -159,6 +159,10 @@ impl Repl {
                     text.push_str(&rendered.join("\t"));
                 }
             }
+            // A compile error names a line the model no longer sees: quote it.
+            Err(mlua::Error::SyntaxError { message, .. }) => {
+                error = Some(syntax_report(code, &message));
+            }
             Err(e) => error = Some(short_error(&e)),
         }
         let trimmed = text.trim_end_matches('\n').len();
@@ -227,6 +231,73 @@ impl Repl {
         v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
         v
     }
+}
+
+/// A Lua compile error as a compiler would print it: the message, the offending
+/// line with a caret under the token Lua stopped at, and the `[[`/`]]` hint when
+/// a long string was closed early by code such as `a[b[1]]`.
+fn syntax_report(code: &str, message: &str) -> String {
+    let line_no = message
+        .strip_prefix("exec:")
+        .and_then(|r| r.split(':').next())
+        .and_then(|n| n.parse::<usize>().ok())
+        .filter(|n| *n >= 1);
+    let Some((line_no, line)) = line_no.and_then(|n| code.lines().nth(n - 1).map(|l| (n, l)))
+    else {
+        return message.to_string();
+    };
+    let col = message
+        .rsplit_once("near '")
+        .and_then(|(_, t)| t.strip_suffix('\''))
+        .and_then(|tok| line.find(tok))
+        .unwrap_or(0);
+    let mut s = format!("{message}\n{line_no:>5}│{line}\n     │{}^", " ".repeat(col));
+    if long_string_closed_early(code, line_no) {
+        s.push_str("\nhint: `]]` closes a `[[` long string; use `[==[ ... ]==]`");
+    }
+    s
+}
+
+/// True when a `[[` long string was opened at or before the failing line and
+/// either that line contains `]]` or a `]]` appears anywhere while no long string
+/// is open: the signature of `[[ ... a[b[1]] ... ]]`, whose intended close comes
+/// after the line Lua complains about.
+fn long_string_closed_early(code: &str, line_no: usize) -> bool {
+    let mut open = false;
+    let mut opened_by_error_line = false;
+    let mut error_line_closes = false;
+    let mut stray = false;
+    for (i, l) in code.lines().enumerate() {
+        let mut rest = l;
+        loop {
+            match (open, rest.find("[["), rest.find("]]")) {
+                (false, Some(o), Some(c)) if c < o => {
+                    stray = true;
+                    rest = &rest[c + 2..];
+                }
+                (false, Some(o), _) => {
+                    open = true;
+                    if i < line_no {
+                        opened_by_error_line = true;
+                    }
+                    rest = &rest[o + 2..];
+                }
+                (false, None, Some(c)) => {
+                    stray = true;
+                    rest = &rest[c + 2..];
+                }
+                (true, _, Some(c)) => {
+                    open = false;
+                    rest = &rest[c + 2..];
+                }
+                _ => break,
+            }
+        }
+        if i + 1 == line_no && l.contains("]]") {
+            error_line_closes = true;
+        }
+    }
+    opened_by_error_line && (stray || error_line_closes)
 }
 
 fn short_error(e: &mlua::Error) -> String {
@@ -321,6 +392,7 @@ pub(crate) mod testkit {
 
 #[cfg(test)]
 mod tests {
+    use super::long_string_closed_early;
     use super::testkit::fixture;
 
     #[tokio::test(flavor = "multi_thread")]
@@ -350,6 +422,46 @@ mod tests {
         assert!(r.error.is_some());
         let r = tokio::task::block_in_place(|| f.repl.exec("1+1"));
         assert_eq!(r.output, "2");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn compile_errors_quote_the_line_with_a_caret_and_the_long_string_hint() {
+        let f = fixture();
+        let run = |code: &str| tokio::task::block_in_place(|| f.repl.exec(code));
+        // Line 3 closes the long string at `chunk[3]]`, the `))` that follow are
+        // parsed as code: the classic first-Rust-file failure.
+        let r = run("x = 1\nlocal src = [[\nlet v = a[b[1]]);\n]]\nfs.write('a.rs', src)");
+        let e = r.error.as_deref().unwrap();
+        assert!(e.starts_with("exec:3: "), "{e}");
+        assert!(e.contains("\n    3│let v = a[b[1]]);\n     │"), "{e}");
+        assert!(e.contains("^"), "{e}");
+        assert!(
+            e.contains("hint: `]]` closes a `[[` long string; use `[==[ ... ]==]`"),
+            "{e}"
+        );
+        // The same file through a level-1 long string compiles.
+        let r = run("src = [==[\nlet v = a[b[1]]);\n]==]\nreturn #src");
+        assert_eq!(r.output, "18", "{r:?}");
+        // A plain syntax error: line and caret, no hint.
+        let r = run("y = 2\nz = (1 +\nw = 3");
+        let e = r.error.as_deref().unwrap();
+        assert!(e.contains("\n    3│w = 3\n     │"), "{e}");
+        assert!(!e.contains("hint:"), "{e}");
+        // A runtime error keeps its plain message.
+        let r = run("error('rt')");
+        assert!(!r.error.as_deref().unwrap().contains("│"));
+    }
+
+    #[test]
+    fn long_string_hint_heuristic() {
+        // Error on the very line that holds the stray `]]`.
+        assert!(long_string_closed_early("s = [[\na[b[1]] x\n]]", 2));
+        // Error later than the stray `]]`.
+        assert!(long_string_closed_early("s = [[\na[b[1]];\nlet y\n]]", 3));
+        // Balanced long string, error elsewhere: no hint.
+        assert!(!long_string_closed_early("s = [[ok]]\nx = (", 2));
+        // No long string at all.
+        assert!(!long_string_closed_early("t = a[b[1]]\nx = (", 2));
     }
 
     #[tokio::test(flavor = "multi_thread")]

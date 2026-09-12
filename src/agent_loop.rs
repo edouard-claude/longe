@@ -18,7 +18,7 @@ use tokio::sync::{mpsc, watch};
 
 use crate::budget::Budget;
 use crate::compact;
-use crate::config::Harness;
+use crate::config::{Harness, SandboxBackend, SandboxMode};
 use crate::llm::{ChatMessage, ChatRequest, LlmError, LlmRegistry, Role};
 use crate::parse::{self, Action};
 use crate::repl::{bindings::REFERENCE, Effects, Repl, ReplCtx};
@@ -57,8 +57,33 @@ Finish with `done(\"summary\")` inside the block: it is accepted only after the 
 Messages from the human, your parent, your children or siblings are injected between turns; read them.\n\
 Your notes are shown back to you in the `Your notes` section below; do not repeat a note that is already there.\n\
 Split parallelizable work across sub-agents with `agent.spawn`; they report back when done.\n\
+To write a file, use `fs.write(p, [==[ ... ]==])`: `]]` occurs in almost all code and closes a plain `[[` string.\n\
+For shell commands use `sh([[ ... ]])`: backslashes in \"...\" strings are Lua escapes.\n\
+{sandbox}\n\
 \n\
-## Bindings\n"
+## Bindings\n",
+        sandbox = sandbox_line(h)
+    )
+}
+
+/// One line of facts about the sandbox, so the model does not discover them by
+/// failing (`pip download` with the network off, `fs.list(\"store\")`).
+fn sandbox_line(h: &Harness) -> String {
+    const HIDDEN: &str = "the store, the evals and ~/.ssh are invisible to `fs` and `sh`; only `verify()` reads the evals and returns its report.";
+    let sb = &h.sandbox;
+    if sb.backend == SandboxBackend::None {
+        return format!(
+            "Sandbox: none (`sh` runs unconfined; `fs` stays inside the workspace); {HIDDEN}"
+        );
+    }
+    let writes = match sb.mode {
+        SandboxMode::ReadOnly => "no writes at all (read-only)",
+        SandboxMode::WorkspaceWrite => "writes allowed in the workspace and /tmp",
+        SandboxMode::FullAccess => "writes allowed anywhere",
+    };
+    format!(
+        "Sandbox: network {}; {writes}; {HIDDEN}",
+        if sb.network { "on" } else { "off" }
     )
 }
 
@@ -393,9 +418,16 @@ async fn run_inner(
                 log(
                     &store,
                     session,
-                    json!({"kind": "exec", "code": code, "output": result.output, "error": result.error, "truncated": result.truncated}),
+                    json!({"kind": "exec", "code": code, "output": result.output, "error": result.error, "truncated": result.truncated, "ignored_blocks": parsed.ignored_blocks}),
                 );
                 let mut feedback = result.render();
+                if parsed.ignored_blocks > 0 {
+                    feedback.push_str(&format!(
+                        "\n[{} other code block{} ignored: one block per turn]",
+                        parsed.ignored_blocks,
+                        if parsed.ignored_blocks > 1 { "s" } else { "" }
+                    ));
+                }
                 let effects = repl.take_effects();
                 feedback = apply_effects(
                     session,
@@ -605,6 +637,30 @@ async fn compact_now(session: &mut Session, deps: &Arc<LoopDeps>, hint: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sandbox_line_states_network_writes_and_hidden_paths() {
+        let mut h = Harness::default();
+        let off = sandbox_line(&h);
+        assert!(
+            off.starts_with("Sandbox: network off; writes allowed in the workspace and /tmp;"),
+            "{off}"
+        );
+        assert!(off.contains("only `verify()` reads the evals"));
+        h.sandbox.network = true;
+        h.sandbox.mode = SandboxMode::ReadOnly;
+        let on = sandbox_line(&h);
+        assert!(
+            on.starts_with("Sandbox: network on; no writes at all (read-only);"),
+            "{on}"
+        );
+        h.sandbox.backend = SandboxBackend::None;
+        assert!(sandbox_line(&h).starts_with("Sandbox: none"));
+        let p = protocol(&h);
+        assert!(p.contains("[==[ ... ]==]"));
+        assert!(p.contains("sh([[ ... ]])"));
+        assert!(p.contains("Sandbox: none"));
+    }
 
     #[test]
     fn notes_section_lists_notes_oldest_first_on_one_line_each() {
